@@ -388,7 +388,7 @@ impl<'a> ApkBuilder<'a> {
         let target_dir = self.build_dir.join(artifact.build_dir());
         self.ndk.ndk_gdb(
             target_dir,
-            "android.app.NativeActivity",
+            "com.google.androidgamesdk.GameActivity",
             self.device_serial.as_deref(),
         )?;
         Ok(())

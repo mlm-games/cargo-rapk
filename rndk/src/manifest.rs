@@ -393,7 +393,7 @@ fn default_namespace() -> String {
 }
 
 fn default_activity_name() -> String {
-    "android.app.NativeActivity".to_string()
+    "com.google.androidgamesdk.GameActivity".to_string()
 }
 
 fn default_config_changes() -> Option<String> {

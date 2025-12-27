@@ -340,7 +340,10 @@ impl Apk {
             .arg("-a")
             .arg("android.intent.action.MAIN")
             .arg("-n")
-            .arg(format!("{}/android.app.NativeActivity", self.package_name));
+            .arg(format!(
+                "{}/com.google.androidgamesdk.GameActivity",
+                self.package_name
+            ));
 
         if !adb.status()?.success() {
             return Err(NdkError::CmdFailed(Box::new(adb)));

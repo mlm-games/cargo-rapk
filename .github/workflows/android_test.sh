@@ -13,7 +13,7 @@ then
     cargo rapk run -p ndk-examples --target x86_64-linux-android --example hello_world --no-logcat
 else
     adb install -r "$1/hello_world.apk"
-    adb shell am start -a android.intent.action.MAIN -n "rust.example.hello_world/android.app.NativeActivity"
+    adb shell am start -a android.intent.action.MAIN -n "rust.example.hello_world/com.google.androidgamesdk.GameActivity"
 fi
 
 sleep 30
