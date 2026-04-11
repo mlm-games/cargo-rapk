@@ -75,6 +75,22 @@ build_targets = [ "armv7-linux-androideabi", "aarch64-linux-android", "i686-linu
 # If not specified, resources will not be included in the APK.
 resources = "path/to/resources_folder"
 
+# Path(s) to Java source directories that should be compiled and packaged
+# into the APK (for helper/callback activities and other Java glue code).
+# Accepts either a single path or an array of paths.
+java_sources = "path/to/java_sources"
+# java_sources = ["path/to/java_sources", "path/to/more_java_sources"]
+
+# Optional: allow dependency crates to contribute Android glue.
+# This block is read from every reachable Cargo package (including dependencies)
+# and merged into the final APK config.
+[package.metadata.android.cargo_rapk]
+java_sources = "android"
+
+[[package.metadata.android.cargo_rapk.activities]]
+name = "rust.rlobkit.RlobKitPickerActivity"
+exported = false
+
 # Path to the folder containing your application's assets.
 # If not specified, assets will not be included in the APK.
 assets = "path/to/assets_folder"
@@ -212,7 +228,11 @@ name = "com.samsung.android.vr.application.mode"
 value = "vr_only"
 
 # See https://developer.android.com/guide/topics/manifest/activity-element
-[package.metadata.android.application.activity]
+#
+# `cargo rapk` accepts both a single `[...activity]` table and repeated
+# `[[...activity]]` tables. Use repeated tables to register multiple
+# activities (for example, a NativeActivity plus helper callback activities).
+[[package.metadata.android.application.activity]]
 
 # See https://developer.android.com/guide/topics/manifest/activity-element#config
 #

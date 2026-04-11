@@ -1,4 +1,6 @@
+use crate::contrib::collect_android_contributions;
 use crate::error::Error;
+use crate::java::compile_java_sources;
 use crate::manifest::{Inheritable, Manifest, Root};
 use cargo_subcommand::{Artifact, ArtifactType, CrateType, Profile, Subcommand};
 use rndk::apk::{Apk, ApkConfig};
@@ -7,7 +9,10 @@ use rndk::error::NdkError;
 use rndk::manifest::{IntentFilter, MetaData};
 use rndk::ndk::{Key, Ndk};
 use rndk::target::Target;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+const NATIVE_ACTIVITY_NAME: &str = "android.app.NativeActivity";
 
 #[derive(Clone, Copy)]
 struct ReproCfg {
@@ -121,7 +126,7 @@ impl<'a> ApkBuilder<'a> {
             panic!("version_code should not be set in TOML");
         }
 
-        let target_sdk_version = *manifest
+        manifest
             .android_manifest
             .sdk
             .target_sdk_version
@@ -132,23 +137,6 @@ impl<'a> ApkBuilder<'a> {
             .application
             .debuggable
             .get_or_insert_with(|| *cmd.profile() == Profile::Dev);
-
-        // Ensure launcher default if missing (Add a default `MAIN` action to launch the activity, if the user didn't supply it by hand.)
-        let activity = &mut manifest.android_manifest.application.activity;
-        if activity
-            .intent_filter
-            .iter()
-            .all(|i| i.actions.iter().all(|f| f != "android.intent.action.MAIN"))
-        {
-            activity.intent_filter.push(IntentFilter {
-                actions: vec!["android.intent.action.MAIN".to_string()],
-                categories: vec!["android.intent.category.LAUNCHER".to_string()],
-                data: vec![],
-            });
-        }
-        if target_sdk_version >= 31 {
-            activity.exported.get_or_insert(true);
-        }
 
         Ok(Self {
             cmd,
@@ -222,12 +210,89 @@ impl<'a> ApkBuilder<'a> {
         if manifest.application.label.is_empty() {
             manifest.application.label = artifact.name.to_string();
         }
-        manifest.application.activity.meta_data.push(MetaData {
-            name: "android.app.lib_name".to_string(),
-            value: artifact.name.replace('-', "_"),
-        });
-
         let crate_path = self.cmd.manifest().parent().expect("invalid manifest path");
+
+        let mut java_sources = self
+            .manifest
+            .java_sources
+            .iter()
+            .map(|p| dunce::simplified(&crate_path.join(p)).to_owned())
+            .collect::<Vec<_>>();
+
+        let contrib = collect_android_contributions(self.cmd.manifest())?;
+        java_sources.extend(contrib.java_sources);
+
+        let mut existing_activity_names = manifest
+            .application
+            .activity
+            .iter()
+            .map(|activity| activity.name.clone())
+            .collect::<HashSet<_>>();
+        for activity in contrib.activities {
+            if existing_activity_names.insert(activity.name.clone()) {
+                manifest.application.activity.push(activity);
+            }
+        }
+
+        if manifest.application.activity.is_empty() {
+            manifest
+                .application
+                .activity
+                .push(rndk::manifest::Activity::default());
+        }
+
+        let has_main_action = manifest.application.activity.iter().any(|activity| {
+            activity
+                .intent_filter
+                .iter()
+                .any(|i| i.actions.iter().any(|f| f == "android.intent.action.MAIN"))
+        });
+        if !has_main_action {
+            let activity_index = manifest
+                .application
+                .activity
+                .iter()
+                .position(|activity| activity.name == NATIVE_ACTIVITY_NAME)
+                .unwrap_or(0);
+            let activity = &mut manifest.application.activity[activity_index];
+            activity.intent_filter.push(IntentFilter {
+                actions: vec!["android.intent.action.MAIN".to_string()],
+                categories: vec!["android.intent.category.LAUNCHER".to_string()],
+                data: vec![],
+            });
+        }
+
+        let target_sdk_version = manifest
+            .sdk
+            .target_sdk_version
+            .unwrap_or_else(|| self.ndk.default_target_platform());
+        if target_sdk_version >= 31 {
+            for activity in &mut manifest.application.activity {
+                if !activity.intent_filter.is_empty() {
+                    activity.exported.get_or_insert(true);
+                }
+            }
+        }
+
+        let lib_name = artifact.name.replace('-', "_");
+        let lib_name_meta = MetaData {
+            name: "android.app.lib_name".to_string(),
+            value: lib_name,
+        };
+        let mut attached_to_native_activity = false;
+        for activity in &mut manifest.application.activity {
+            if activity.name == NATIVE_ACTIVITY_NAME {
+                activity.meta_data.push(lib_name_meta.clone());
+                attached_to_native_activity = true;
+            }
+        }
+        if !attached_to_native_activity {
+            manifest.application.activity[0]
+                .meta_data
+                .push(lib_name_meta);
+        }
+
+        let java_sources = dedup_paths(java_sources);
         let is_debug_profile = *self.cmd.profile() == Profile::Dev;
         let assets = self
             .manifest
@@ -244,6 +309,9 @@ impl<'a> ApkBuilder<'a> {
             .runtime_libs
             .as_ref()
             .map(|p| dunce::simplified(&crate_path.join(p)).to_owned());
+        if !java_sources.is_empty() {
+            manifest.application.has_code = true;
+        }
         let apk_name = self
             .manifest
             .apk_name
@@ -267,6 +335,22 @@ impl<'a> ApkBuilder<'a> {
             zip_timestamp: self.repro.ts_unix,
         };
         let mut apk = config.create_apk()?;
+
+        if !java_sources.is_empty() {
+            let dex_files = compile_java_sources(
+                &self.ndk,
+                java_sources.as_slice(),
+                &config.build_dir,
+                self.min_sdk_version(),
+                target_sdk_version,
+            )?;
+            for dex_file in dex_files {
+                let file_name = dex_file
+                    .file_name()
+                    .ok_or_else(|| NdkError::PathNotFound(dex_file.clone()))?;
+                apk.add_file(&dex_file, Path::new(file_name))?;
+            }
+        }
 
         for target in &self.build_targets {
             let triple = target.rust_triple();
@@ -388,7 +472,7 @@ impl<'a> ApkBuilder<'a> {
         let target_dir = self.build_dir.join(artifact.build_dir());
         self.ndk.ndk_gdb(
             target_dir,
-            "android.app.NativeActivity",
+            NATIVE_ACTIVITY_NAME,
             self.device_serial.as_deref(),
         )?;
         Ok(())
@@ -434,5 +518,39 @@ impl<'a> ApkBuilder<'a> {
             .min_sdk_version
             .unwrap_or(23)
             .max(23)
+    }
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedup_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dedup_paths_preserves_first_occurrence_order() {
+        let input = vec![
+            PathBuf::from("a"),
+            PathBuf::from("b"),
+            PathBuf::from("a"),
+            PathBuf::from("c"),
+            PathBuf::from("b"),
+        ];
+
+        let output = dedup_paths(input);
+        assert_eq!(
+            output,
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
     }
 }

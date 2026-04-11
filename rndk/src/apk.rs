@@ -102,14 +102,14 @@ impl ApkConfig {
 
         Ok(UnalignedApk {
             config: self,
-            pending_libs: HashSet::default(),
+            pending_entries: HashSet::default(),
         })
     }
 }
 
 pub struct UnalignedApk<'a> {
     config: &'a ApkConfig,
-    pending_libs: HashSet<String>,
+    pending_entries: HashSet<String>,
 }
 
 impl<'a> UnalignedApk<'a> {
@@ -174,7 +174,7 @@ impl<'a> UnalignedApk<'a> {
         // Otherwise, it results in a runtime error when loading the NativeActivity `.so` library.
         let lib_path_unix = lib_path.to_str().unwrap().replace('\\', "/");
 
-        self.pending_libs.insert(lib_path_unix);
+        self.pending_entries.insert(lib_path_unix);
 
         Ok(())
     }
@@ -196,6 +196,22 @@ impl<'a> UnalignedApk<'a> {
         Ok(())
     }
 
+    pub fn add_file(&mut self, src: &Path, dst: &Path) -> Result<(), NdkError> {
+        if !src.exists() {
+            return Err(NdkError::PathNotFound(src.into()));
+        }
+        let out = self.config.build_dir.join(dst);
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, out)?;
+
+        let dst_unix = dst.to_string_lossy().replace('\\', "/");
+        self.pending_entries.insert(dst_unix);
+
+        Ok(())
+    }
+
     pub fn add_pending_libs_and_align(self) -> Result<UnsignedApk<'a>, NdkError> {
         // add libs in stable order
         let mut aapt = self.config.build_tool(bin!("aapt"))?;
@@ -204,10 +220,10 @@ impl<'a> UnalignedApk<'a> {
             aapt.arg("-0").arg("");
         }
         aapt.arg(self.config.unaligned_apk());
-        let mut libs: Vec<_> = self.pending_libs.into_iter().collect();
-        libs.sort();
-        for lib_path_unix in libs {
-            aapt.arg(lib_path_unix);
+        let mut entries: Vec<_> = self.pending_entries.into_iter().collect();
+        entries.sort();
+        for path_unix in entries {
+            aapt.arg(path_unix);
         }
         if !aapt.status()?.success() {
             return Err(NdkError::CmdFailed(Box::new(aapt)));
@@ -377,6 +393,11 @@ impl Apk {
         let uid = uid
             .strip_prefix("uid:")
             .ok_or(NdkError::UidNotInOutput(output.to_owned()))?;
+        let uid = uid
+            .split(',')
+            .find(|part| !part.trim().is_empty())
+            .unwrap_or(uid)
+            .trim();
         uid.parse()
             .map_err(|e| NdkError::NotAUid(e, uid.to_owned()))
     }

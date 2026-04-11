@@ -1,5 +1,5 @@
 use crate::error::NdkError;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 
 /// Android [manifest element](https://developer.android.com/guide/topics/manifest/manifest-element), containing an [`Application`] element.
@@ -70,8 +70,8 @@ impl AndroidManifest {
     }
 }
 
-/// Android [application element](https://developer.android.com/guide/topics/manifest/application-element), containing an [`Activity`] element.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// Android [application element](https://developer.android.com/guide/topics/manifest/application-element), containing one or more [`Activity`] elements.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Application {
     #[serde(
         rename(serialize = "@android:debuggable"),
@@ -108,8 +108,46 @@ pub struct Application {
     #[serde(rename(serialize = "meta-data"))]
     #[serde(default)]
     pub meta_data: Vec<MetaData>,
-    #[serde(default)]
-    pub activity: Activity,
+    #[serde(default = "default_activities")]
+    #[serde(deserialize_with = "deserialize_activities")]
+    pub activity: Vec<Activity>,
+}
+
+impl Default for Application {
+    fn default() -> Self {
+        Self {
+            debuggable: None,
+            theme: None,
+            has_code: false,
+            icon: None,
+            label: String::new(),
+            extract_native_libs: None,
+            uses_cleartext_traffic: None,
+            meta_data: Vec::new(),
+            activity: default_activities(),
+        }
+    }
+}
+
+fn default_activities() -> Vec<Activity> {
+    vec![Activity::default()]
+}
+
+fn deserialize_activities<'de, D>(deserializer: D) -> Result<Vec<Activity>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        One(T),
+        Many(Vec<T>),
+    }
+
+    match OneOrMany::<Activity>::deserialize(deserializer)? {
+        OneOrMany::One(activity) => Ok(vec![activity]),
+        OneOrMany::Many(activities) => Ok(activities),
+    }
 }
 
 /// Android [activity element](https://developer.android.com/guide/topics/manifest/activity-element).

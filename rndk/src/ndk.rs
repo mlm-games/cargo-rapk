@@ -529,16 +529,34 @@ impl Ndk {
     }
 
     pub fn keytool(&self) -> Result<Command, NdkError> {
-        if let Ok(keytool) = which::which(bin!("keytool")) {
-            return Ok(Command::new(keytool));
+        self.java_tool("keytool")
+    }
+
+    pub fn javac(&self) -> Result<Command, NdkError> {
+        self.java_tool("javac")
+    }
+
+    pub fn d8(&self) -> Result<Command, NdkError> {
+        self.build_tool(bat!("d8"))
+    }
+
+    fn java_tool(&self, tool: &str) -> Result<Command, NdkError> {
+        let tool_bin = if cfg!(target_os = "windows") {
+            format!("{tool}.exe")
+        } else {
+            tool.to_string()
+        };
+
+        if let Ok(path) = which::which(&tool_bin) {
+            return Ok(Command::new(path));
         }
-        if let Ok(java) = std::env::var("JAVA_HOME") {
-            let keytool = PathBuf::from(java).join("bin").join(bin!("keytool"));
-            if keytool.exists() {
-                return Ok(Command::new(keytool));
+        if let Ok(java_home) = std::env::var("JAVA_HOME") {
+            let candidate = PathBuf::from(java_home).join("bin").join(&tool_bin);
+            if candidate.exists() {
+                return Ok(Command::new(candidate));
             }
         }
-        Err(NdkError::CmdNotFound("keytool".to_string()))
+        Err(NdkError::CmdNotFound(tool.to_string()))
     }
 
     pub fn debug_key(&self) -> Result<Key, NdkError> {

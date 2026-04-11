@@ -2,7 +2,7 @@ use crate::error::Error;
 use rndk::apk::StripConfig;
 use rndk::manifest::AndroidManifest;
 use rndk::target::Target;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -22,6 +22,7 @@ pub(crate) struct Manifest {
     pub(crate) build_targets: Vec<Target>,
     pub(crate) assets: Option<PathBuf>,
     pub(crate) resources: Option<PathBuf>,
+    pub(crate) java_sources: Vec<PathBuf>,
     pub(crate) runtime_libs: Option<PathBuf>,
     /// Maps profiles to keystores
     pub(crate) signing: HashMap<String, Signing>,
@@ -49,6 +50,7 @@ impl Manifest {
             build_targets: metadata.build_targets,
             assets: metadata.assets,
             resources: metadata.resources,
+            java_sources: metadata.java_sources,
             runtime_libs: metadata.runtime_libs,
             signing: metadata.signing,
             reverse_port_forward: metadata.reverse_port_forward,
@@ -102,6 +104,9 @@ struct AndroidMetadata {
     build_targets: Vec<Target>,
     assets: Option<PathBuf>,
     resources: Option<PathBuf>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_one_or_many")]
+    java_sources: Vec<PathBuf>,
     runtime_libs: Option<PathBuf>,
     /// Maps profiles to keystores
     #[serde(default)]
@@ -113,8 +118,177 @@ struct AndroidMetadata {
     strip: StripConfig,
 }
 
+pub(crate) fn deserialize_one_or_many<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        One(T),
+        Many(Vec<T>),
+    }
+
+    match OneOrMany::<T>::deserialize(deserializer)? {
+        OneOrMany::One(value) => Ok(vec![value]),
+        OneOrMany::Many(values) => Ok(values),
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct Signing {
     pub(crate) path: PathBuf,
     pub(crate) keystore_password: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_android_metadata(toml_source: &str) -> AndroidMetadata {
+        let root: Root = toml::from_str(toml_source).expect("failed to parse manifest toml");
+        let package = root.package.expect("missing package table");
+        package
+            .metadata
+            .expect("missing package metadata")
+            .android
+            .expect("missing android metadata")
+    }
+
+    #[test]
+    fn parses_single_activity_table() {
+        let metadata = parse_android_metadata(
+            r#"
+                [package]
+                version = "0.1.0"
+
+                [package.metadata.android.application.activity]
+                name = "android.app.NativeActivity"
+            "#,
+        );
+
+        assert_eq!(metadata.android_manifest.application.activity.len(), 1);
+        assert_eq!(
+            metadata.android_manifest.application.activity[0].name,
+            "android.app.NativeActivity"
+        );
+    }
+
+    #[test]
+    fn parses_multiple_activity_tables() {
+        let metadata = parse_android_metadata(
+            r#"
+                [package]
+                version = "0.1.0"
+
+                [[package.metadata.android.application.activity]]
+                name = "android.app.NativeActivity"
+
+                [[package.metadata.android.application.activity]]
+                name = "rust.rlobkit.RlobKitPickerActivity"
+                exported = false
+            "#,
+        );
+
+        assert_eq!(metadata.android_manifest.application.activity.len(), 2);
+        assert_eq!(
+            metadata.android_manifest.application.activity[1].name,
+            "rust.rlobkit.RlobKitPickerActivity"
+        );
+    }
+
+    #[test]
+    fn parses_java_sources_single_and_multiple() {
+        let single = parse_android_metadata(
+            r#"
+                [package]
+                version = "0.1.0"
+
+                [package.metadata.android]
+                java_sources = "android"
+            "#,
+        );
+        assert_eq!(single.java_sources, vec![PathBuf::from("android")]);
+
+        let multiple = parse_android_metadata(
+            r#"
+                [package]
+                version = "0.1.0"
+
+                [package.metadata.android]
+                java_sources = ["android", "third_party/android"]
+            "#,
+        );
+        assert_eq!(
+            multiple.java_sources,
+            vec![
+                PathBuf::from("android"),
+                PathBuf::from("third_party/android")
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_cargo_rapk_contribution_metadata() {
+        #[derive(Deserialize)]
+        struct RootMeta {
+            package: PackageMeta,
+        }
+
+        #[derive(Deserialize)]
+        struct PackageMeta {
+            metadata: PackageAndroidMeta,
+        }
+
+        #[derive(Deserialize)]
+        struct PackageAndroidMeta {
+            android: PackageCargoRapkMeta,
+        }
+
+        #[derive(Deserialize)]
+        struct PackageCargoRapkMeta {
+            cargo_rapk: ContributionMeta,
+        }
+
+        #[derive(Deserialize)]
+        struct ContributionMeta {
+            #[serde(default)]
+            #[serde(deserialize_with = "deserialize_one_or_many")]
+            java_sources: Vec<PathBuf>,
+            #[serde(default)]
+            #[serde(deserialize_with = "deserialize_one_or_many")]
+            activities: Vec<rndk::manifest::Activity>,
+        }
+
+        let manifest: RootMeta = toml::from_str(
+            r#"
+                [package]
+                version = "0.1.0"
+
+                [package.metadata.android.cargo_rapk]
+                java_sources = "android"
+
+                [[package.metadata.android.cargo_rapk.activities]]
+                name = "rust.rlobkit.RlobKitPickerActivity"
+                exported = false
+            "#,
+        )
+        .expect("failed to parse cargo_rapk contribution metadata");
+
+        assert_eq!(
+            manifest.package.metadata.android.cargo_rapk.java_sources,
+            vec![PathBuf::from("android")]
+        );
+        assert_eq!(
+            manifest
+                .package
+                .metadata
+                .android
+                .cargo_rapk
+                .activities
+                .len(),
+            1
+        );
+    }
 }
