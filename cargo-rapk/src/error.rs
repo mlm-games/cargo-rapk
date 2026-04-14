@@ -21,6 +21,8 @@ pub enum Error {
     MetadataJson(#[from] JsonError),
     #[error("Configure a release keystore via `[package.metadata.android.signing.{0}]`")]
     MissingReleaseKey(String),
+    #[error("Set the keystore password via CARGO_RAPK_{0}_KEYSTORE_PASSWORD")]
+    MissingKeystorePassword(String),
     #[error("`workspace=false` is unsupported")]
     InheritedFalse,
     #[error("`workspace=true` requires a workspace")]

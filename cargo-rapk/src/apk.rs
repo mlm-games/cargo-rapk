@@ -412,14 +412,15 @@ impl<'a> ApkBuilder<'a> {
         let password_env = format!("{keystore_env}_PASSWORD");
         let path = std::env::var_os(&keystore_env).map(PathBuf::from);
         let password = std::env::var(&password_env).ok();
-        let crate_path = self.cmd.manifest().parent().expect("invalid manifest path");
         let signing_key = match (path, password) {
             (Some(path), Some(password)) => Key { path, password },
             (Some(path), None) if *self.cmd.profile() == Profile::Dev => Key {
                 path,
                 password: rndk::ndk::DEFAULT_DEV_KEYSTORE_PASSWORD.to_owned(),
             },
-            (Some(_path), None) => return Err(Error::MissingReleaseKey(profile_name.to_owned())),
+            (Some(_path), None) => {
+                return Err(Error::MissingKeystorePassword(profile_name.to_owned()));
+            }
             (None, _) => {
                 if let Some(msk) = self.manifest.signing.get(profile_name) {
                     Key {
