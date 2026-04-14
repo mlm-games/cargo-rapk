@@ -15,4 +15,8 @@ fn android_main(_app: AndroidApp) {
 
     info!("hello world");
     println!("hello world");
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }

@@ -79,6 +79,7 @@ jobs:
     name: hello_world example on emulator
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         source_os: [local, windows-latest, macos-latest]
@@ -137,6 +138,7 @@ jobs:
           script: echo "Generated AVD snapshot for caching."
 
       - name: Start hello_world example
+        timeout-minutes: 10
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: ${{ env.api-level }}

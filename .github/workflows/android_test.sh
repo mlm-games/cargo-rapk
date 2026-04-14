@@ -28,6 +28,9 @@ else
     exit 1
 fi
 
+adb -e emu kill || true
+sleep 2
+
 ERROR_MSG=$(grep -e 'thread.*panicked at' "$HOME"/logcat.log | true)
 if [ -z "${ERROR_MSG}" ];
 then
