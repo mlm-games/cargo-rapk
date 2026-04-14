@@ -138,6 +138,8 @@ jobs:
           script: echo "Generated AVD snapshot for caching."
 
       - name: Start hello_world example
+        id: emulator_run
+        continue-on-error: true
         timeout-minutes: 10
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -149,6 +151,9 @@ jobs:
           disable-animations: true
           force-avd-creation: false
           script: ./.github/workflows/android_test.sh "${{ steps.download.outputs.download-path }}"
+
+      - name: Check test actually passed
+        run: grep -q 'hello world' ~/logcat.log
 
       - name: Upload emulator logs
         uses: actions/upload-artifact@v4
