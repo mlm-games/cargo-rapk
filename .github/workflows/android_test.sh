@@ -28,13 +28,13 @@ else
     exit 1
 fi
 
-ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL=0 adb -e emu kill || true
-sleep 2
+EMULATOR_PID=$(pgrep -f "emulator" | head -1)
 
-pkill -9 -f "qemu-system" 2>/dev/null || true
-pkill -9 -f "emulator64" 2>/dev/null || true
-pkill -9 -f "emulator-" 2>/dev/null || true
-sleep 1
+adb -e emu kill 2>/dev/null || true
+
+if [ -n "$EMULATOR_PID" ]; then
+    kill -9 "$EMULATOR_PID" 2>/dev/null || true
+fi
 
 ERROR_MSG=$(grep -e 'thread.*panicked at' "$HOME"/logcat.log | true)
 if [ -z "${ERROR_MSG}" ];
