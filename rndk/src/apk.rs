@@ -246,7 +246,7 @@ impl<'a> UnalignedApk<'a> {
         let page_size_kb = std::env::var("CARGO_RAPK_PAGE_SIZE_KB")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(4);
+            .unwrap_or(16);
         let bt_ver = self.config.ndk.build_tools_version();
         if bt_ver >= "35.0.0" {
             zipalign.arg("-P").arg(page_size_kb.to_string());
