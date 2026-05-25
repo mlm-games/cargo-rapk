@@ -91,7 +91,7 @@ enum RapkSubCmd {
     Version,
 }
 
-fn split_apk_and_cargo_args(input: Vec<String>) -> (Args, Vec<String>) {
+fn split_apk_and_cargo_args(input: Vec<String>) -> anyhow::Result<(Args, Vec<String>)> {
     // Clap doesn't support parsing unknown args properly:
     // https://github.com/clap-rs/clap/issues/1404
     // https://github.com/clap-rs/clap/issues/4498
@@ -139,8 +139,9 @@ fn split_apk_and_cargo_args(input: Vec<String>) -> (Args, Vec<String>) {
     let m = Args::command()
         .no_binary_name(true)
         .get_matches_from(&split_args.apk_args);
-    let args = Args::from_arg_matches(&m).unwrap();
-    (args, split_args.cargo_args)
+    let args =
+        Args::from_arg_matches(&m).map_err(|e| anyhow::anyhow!("Failed to parse args: {}", e))?;
+    Ok((args, split_args.cargo_args))
 }
 
 fn iterator_single_item<T>(mut iter: impl Iterator<Item = T>) -> Option<T> {
@@ -159,29 +160,27 @@ fn main() -> anyhow::Result<()> {
         apk: RapkCmd::Rapk { cmd },
     } = Cmd::parse();
 
+    macro_rules! prepare {
+        ($args:expr, $cmd:ident, $builder:ident) => {
+            let $cmd = Subcommand::new($args.subcommand_args)?;
+            let mut $builder = ApkBuilder::from_subcommand(&$cmd, $args.device)?;
+            $builder.set_repro_flags(
+                $args.deterministic,
+                $args.unsigned,
+                $args.align,
+                $args.timestamp,
+                $args.no_normalize_zip,
+            );
+        };
+    }
+
     match cmd {
         RapkSubCmd::Check { args } => {
-            let cmd = Subcommand::new(args.subcommand_args)?;
-            let mut builder = ApkBuilder::from_subcommand(&cmd, args.device)?;
-            builder.set_repro_flags(
-                args.deterministic,
-                args.unsigned,
-                args.align,
-                args.timestamp,
-                args.no_normalize_zip,
-            );
+            prepare!(args, _cmd, builder);
             builder.check()?;
         }
         RapkSubCmd::Build { args } => {
-            let cmd = Subcommand::new(args.subcommand_args)?;
-            let mut builder = ApkBuilder::from_subcommand(&cmd, args.device)?;
-            builder.set_repro_flags(
-                args.deterministic,
-                args.unsigned,
-                args.align,
-                args.timestamp,
-                args.no_normalize_zip,
-            );
+            prepare!(args, cmd, builder);
             for artifact in cmd.artifacts() {
                 builder.build(artifact)?;
             }
@@ -190,41 +189,17 @@ fn main() -> anyhow::Result<()> {
             cargo_cmd,
             cargo_args,
         } => {
-            let (args, cargo_args) = split_apk_and_cargo_args(cargo_args);
-            let cmd = Subcommand::new(args.subcommand_args)?;
-            let mut builder = ApkBuilder::from_subcommand(&cmd, args.device)?;
-            builder.set_repro_flags(
-                args.deterministic,
-                args.unsigned,
-                args.align,
-                args.timestamp,
-                args.no_normalize_zip,
-            );
+            let (args, cargo_args) = split_apk_and_cargo_args(cargo_args)?;
+            prepare!(args, _cmd, builder);
             builder.default(&cargo_cmd, &cargo_args)?;
         }
         RapkSubCmd::Run { args, no_logcat } => {
-            let cmd = Subcommand::new(args.subcommand_args)?;
-            let mut builder = ApkBuilder::from_subcommand(&cmd, args.device)?;
-            builder.set_repro_flags(
-                args.deterministic,
-                args.unsigned,
-                args.align,
-                args.timestamp,
-                args.no_normalize_zip,
-            );
+            prepare!(args, cmd, builder);
             let artifact = iterator_single_item(cmd.artifacts()).ok_or(Error::invalid_args())?;
             builder.run(artifact, no_logcat)?;
         }
         RapkSubCmd::Gdb { args } => {
-            let cmd = Subcommand::new(args.subcommand_args)?;
-            let mut builder = ApkBuilder::from_subcommand(&cmd, args.device)?;
-            builder.set_repro_flags(
-                args.deterministic,
-                args.unsigned,
-                args.align,
-                args.timestamp,
-                args.no_normalize_zip,
-            );
+            prepare!(args, cmd, builder);
             let artifact = iterator_single_item(cmd.artifacts()).ok_or(Error::invalid_args())?;
             builder.gdb(artifact)?;
         }
@@ -239,8 +214,10 @@ fn main() -> anyhow::Result<()> {
 fn test_split_apk_and_cargo_args() {
     // Set up a default because cargo-subcommand doesn't derive a default
     let args_default = Args::parse_from(std::iter::empty::<&str>());
+    let check = |input: Vec<String>| split_apk_and_cargo_args(input).unwrap();
+
     assert_eq!(
-        split_apk_and_cargo_args(vec!["--quiet".into()]),
+        check(vec!["--quiet".into()]),
         (
             Args {
                 subcommand_args: cargo_subcommand::Args {
@@ -254,7 +231,7 @@ fn test_split_apk_and_cargo_args() {
     );
 
     assert_eq!(
-        split_apk_and_cargo_args(vec!["unrecognized".to_string(), "--quiet".to_string()]),
+        check(vec!["unrecognized".to_string(), "--quiet".to_string()]),
         (
             Args {
                 subcommand_args: cargo_subcommand::Args {
@@ -268,7 +245,7 @@ fn test_split_apk_and_cargo_args() {
     );
 
     assert_eq!(
-        split_apk_and_cargo_args(vec!["--unrecognized".to_string(), "--quiet".to_string()]),
+        check(vec!["--unrecognized".to_string(), "--quiet".to_string()]),
         (
             Args {
                 subcommand_args: cargo_subcommand::Args {
@@ -282,7 +259,7 @@ fn test_split_apk_and_cargo_args() {
     );
 
     assert_eq!(
-        split_apk_and_cargo_args(vec!["-p".to_string(), "foo".to_string()]),
+        check(vec!["-p".to_string(), "foo".to_string()]),
         (
             Args {
                 subcommand_args: cargo_subcommand::Args {
@@ -296,7 +273,7 @@ fn test_split_apk_and_cargo_args() {
     );
 
     assert_eq!(
-        split_apk_and_cargo_args(vec![
+        check(vec![
             "-p".to_string(),
             "foo".to_string(),
             "--unrecognized".to_string(),
@@ -316,7 +293,7 @@ fn test_split_apk_and_cargo_args() {
     );
 
     assert_eq!(
-        split_apk_and_cargo_args(vec![
+        check(vec![
             "--no-deps".to_string(),
             "-p".to_string(),
             "foo".to_string(),
@@ -337,7 +314,7 @@ fn test_split_apk_and_cargo_args() {
     );
 
     assert_eq!(
-        split_apk_and_cargo_args(vec![
+        check(vec![
             "--no-deps".to_string(),
             "--device".to_string(),
             "adb:test".to_string(),

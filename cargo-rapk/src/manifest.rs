@@ -37,7 +37,7 @@ impl Manifest {
         // a `[package]` table (with a matching `name` when requested by the user)
         let package = toml
             .package
-            .unwrap_or_else(|| panic!("Manifest `{:?}` must contain a `[package]`", path));
+            .ok_or_else(|| Error::MissingPackageTable(path.to_path_buf()))?;
         let metadata = package
             .metadata
             .unwrap_or_default()

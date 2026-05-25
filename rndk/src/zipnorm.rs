@@ -20,9 +20,9 @@ pub fn normalize_zip(data: &[u8], _ts: Option<u64>) -> Result<Vec<u8>, std::io::
     let mut src = ZipArchive::new(Cursor::new(data))?;
 
     // Deterministic order: lexicographic filenames
-    let mut names = (0..src.len())
-        .map(|i| src.by_index(i).map(|f| f.name().to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut names: Vec<String> = (0..src.len())
+        .filter_map(|i| src.by_index(i).ok().map(|f| f.name().to_string()))
+        .collect();
     names.sort();
 
     // Fixed DOS time (1980-01-01 00:00:00)

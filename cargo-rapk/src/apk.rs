@@ -93,12 +93,7 @@ impl<'a> ApkBuilder<'a> {
                 let workspace = workspace_manifest
                     .ok_or(Error::InheritanceMissingWorkspace)?
                     .workspace
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Manifest `{:?}` must contain a `[workspace]` table",
-                            cmd.workspace_manifest().unwrap()
-                        )
-                    });
+                    .ok_or(Error::MissingWorkspaceTable)?;
                 workspace
                     .package
                     .ok_or(Error::WorkspaceMissingInheritedField("package"))?
@@ -115,7 +110,7 @@ impl<'a> ApkBuilder<'a> {
             .replace(package_version)
             .is_some()
         {
-            panic!("version_name should not be set in TOML");
+            return Err(Error::VersionNameSet);
         }
         if manifest
             .android_manifest
@@ -123,7 +118,7 @@ impl<'a> ApkBuilder<'a> {
             .replace(version_code)
             .is_some()
         {
-            panic!("version_code should not be set in TOML");
+            return Err(Error::VersionCodeSet);
         }
 
         manifest
@@ -523,14 +518,11 @@ impl<'a> ApkBuilder<'a> {
 }
 
 fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut deduped = Vec::new();
     let mut seen = HashSet::new();
-    for path in paths {
-        if seen.insert(path.clone()) {
-            deduped.push(path);
-        }
-    }
-    deduped
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 #[cfg(test)]

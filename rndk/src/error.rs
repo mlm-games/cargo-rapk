@@ -47,6 +47,8 @@ pub enum NdkError {
     IoPathError(PathBuf, #[source] IoError),
     #[error("Invalid semver")]
     InvalidSemver,
+    #[error("Environment variable `{0}` contains non-unicode characters")]
+    NonUnicodeEnvVar(&'static str),
     #[error("Command `{}` had a non-zero exit code.", format!("{:?}", .0).replace('"', ""))]
     CmdFailed(Box<Command>),
     #[error(transparent)]

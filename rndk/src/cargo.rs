@@ -33,11 +33,11 @@ pub fn cargo_ndk(
             }
             Err(std::env::VarError::NotPresent) => String::new(),
             Err(std::env::VarError::NotUnicode(_)) => {
-                panic!("RUSTFLAGS environment variable contains non-unicode characters")
+                return Err(NdkError::NonUnicodeEnvVar("RUSTFLAGS"));
             }
         },
         Err(std::env::VarError::NotUnicode(_)) => {
-            panic!("CARGO_ENCODED_RUSTFLAGS environment variable contains non-unicode characters")
+            return Err(NdkError::NonUnicodeEnvVar("CARGO_ENCODED_RUSTFLAGS"));
         }
     };
 

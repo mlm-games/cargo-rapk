@@ -23,14 +23,9 @@ pub fn get_libs_search_paths(
             for line in BufReader::new(File::open(output_file)?).lines() {
                 let line = line?;
                 if let Some(link_search) = line.strip_prefix("cargo:rustc-link-search=") {
-                    let mut pie = link_search.split('=');
-                    let (kind, path) = match (pie.next(), pie.next()) {
-                        (Some(kind), Some(path)) => (kind, path),
-                        (Some(path), None) => ("all", path),
-                        _ => unreachable!(),
-                    };
+                    let kind = link_search.split('=').next().unwrap_or("all");
+                    let path = link_search.split('=').nth(1).unwrap_or(link_search);
                     match kind {
-                        // FIXME: which kinds of search path we interested in
                         "dependency" | "native" | "all" => paths.push(path.into()),
                         _ => (),
                     };

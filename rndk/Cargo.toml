@@ -19,4 +19,3 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 which = "8"
 zip = { version = "6", default-features = false, features = ["deflate"] }
-atty = "0.2"

@@ -9,8 +9,10 @@ use toml::de::Error as TomlError;
 pub enum Error {
     #[error(transparent)]
     Subcommand(#[from] SubcommandError),
-    #[error("Failed to parse config.")]
+    #[error("Failed to parse config: {0}")]
     Config(#[from] TomlError),
+    #[error("Manifest `{0}` must contain a `[package]` table")]
+    MissingPackageTable(std::path::PathBuf),
     #[error(transparent)]
     Ndk(#[from] NdkError),
     #[error(transparent)]
@@ -27,8 +29,14 @@ pub enum Error {
     InheritedFalse,
     #[error("`workspace=true` requires a workspace")]
     InheritanceMissingWorkspace,
+    #[error("Workspace root manifest has no `[workspace]` table")]
+    MissingWorkspaceTable,
     #[error("Failed to inherit field: `workspace.{0}` was not defined in workspace root manifest")]
     WorkspaceMissingInheritedField(&'static str),
+    #[error("`version_name` must not be set manually; it is derived from the package version")]
+    VersionNameSet,
+    #[error("`version_code` must not be set manually; it is derived from the package version")]
+    VersionCodeSet,
 }
 
 impl Error {

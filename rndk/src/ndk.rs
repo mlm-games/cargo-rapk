@@ -8,10 +8,9 @@ use std::process::Command;
 /// [`Ndk::debug_key`]
 pub const DEFAULT_DEV_KEYSTORE_PASSWORD: &str = "android";
 
-use atty::Stream;
-
 fn is_tty() -> bool {
-    atty::is(Stream::Stdin) && atty::is(Stream::Stdout)
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 fn infer_sdk_from_adb() -> Option<std::path::PathBuf> {
@@ -45,18 +44,18 @@ fn validate_sdk_root(p: &std::path::Path) -> bool {
     p.join("platforms").exists() && p.join("build-tools").exists()
 }
 
-fn parse_pkg_revision(s: &str) -> (u32, u32, u32, bool) {
+fn parse_pkg_revision(s: &str) -> Option<(u32, u32, u32, bool)> {
     // returns (major, minor, patch, is_beta)
     // Accept 25.2.9519653 or 25.2.9519653-beta1
     let mut parts = s.trim().split('.');
-    let major = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let minor = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let rest = parts.next().unwrap_or("0");
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let rest = parts.next()?;
     let (patch_str, beta) = rest
         .split_once('-')
         .map_or((rest, false), |(a, _)| (a, true));
-    let patch = patch_str.parse().unwrap_or(0);
-    (major, minor, patch, beta)
+    let patch = patch_str.parse().ok()?;
+    Some((major, minor, patch, beta))
 }
 
 fn best_ndk_under(sdk: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -79,13 +78,14 @@ fn best_ndk_under(sdk: &std::path::Path) -> Option<std::path::PathBuf> {
                 .map(|(_, v)| v.trim());
 
             if let Some(v) = revision_line {
-                let rev = parse_pkg_revision(v);
-                let pick = match &best {
-                    None => true,
-                    Some((_, old)) => rev > *old,
-                };
-                if pick {
-                    best = Some((cand.clone(), rev));
+                if let Some(rev) = parse_pkg_revision(v) {
+                    let pick = match &best {
+                        None => true,
+                        Some((_, old)) => rev > *old,
+                    };
+                    if pick {
+                        best = Some((cand.clone(), rev));
+                    }
                 }
             }
         }
@@ -237,42 +237,39 @@ impl Ndk {
             .ok_or(NdkError::BuildToolsNotFound)?;
 
         let build_tag = std::fs::read_to_string(ndk_path.join("source.properties"))
-            .expect("Failed to read source.properties");
+            .map_err(|e| NdkError::IoPathError(ndk_path.join("source.properties"), e))?;
 
         let build_tag = build_tag
-            .split('\n')
+            .lines()
             .find_map(|line| {
-                let (key, value) = line
-                    .split_once('=')
-                    .expect("Failed to parse `key = value` from source.properties");
+                let (key, value) = line.split_once('=')?;
                 if key.trim() == "Pkg.Revision" {
-                    // AOSP writes a constantly-incrementing build version to the patch field.
-                    // This number is incrementing across NDK releases.
                     let mut parts = value.trim().split('.');
-                    let _major = parts.next().unwrap();
-                    let _minor = parts.next().unwrap();
-                    let patch = parts.next().unwrap();
-                    // Can have an optional `XXX-beta1`
+                    let _major = parts.next()?;
+                    let _minor = parts.next()?;
+                    let patch = parts.next()?;
                     let patch = patch.split_once('-').map_or(patch, |(patch, _beta)| patch);
-                    Some(patch.parse().expect("Failed to parse patch field"))
+                    patch.parse::<u32>().ok()
                 } else {
                     None
                 }
             })
-            .expect("No `Pkg.Revision` in source.properties");
+            .ok_or(NdkError::InvalidSemver)?;
 
         let ndk_platforms = std::fs::read_to_string(ndk_path.join("build/core/platforms.mk"))?;
-        let ndk_platforms = ndk_platforms
-            .split('\n')
-            .map(|s| s.split_once(" := ").unwrap())
-            .collect::<HashMap<_, _>>();
+        let ndk_platforms: HashMap<_, _> = ndk_platforms
+            .lines()
+            .filter_map(|s| s.split_once(" := "))
+            .collect();
 
-        let min_platform_level = ndk_platforms["NDK_MIN_PLATFORM_LEVEL"]
-            .parse::<u32>()
-            .unwrap();
-        let max_platform_level = ndk_platforms["NDK_MAX_PLATFORM_LEVEL"]
-            .parse::<u32>()
-            .unwrap();
+        let min_platform_level = ndk_platforms
+            .get("NDK_MIN_PLATFORM_LEVEL")
+            .and_then(|s| s.parse().ok())
+            .ok_or(NdkError::InvalidSemver)?;
+        let max_platform_level = ndk_platforms
+            .get("NDK_MAX_PLATFORM_LEVEL")
+            .and_then(|s| s.parse().ok())
+            .ok_or(NdkError::InvalidSemver)?;
         let platforms_dir = sdk_path.join("platforms");
         let platforms: Vec<u32> = std::fs::read_dir(&platforms_dir)
             .or(Err(NdkError::PathNotFound(platforms_dir)))?
