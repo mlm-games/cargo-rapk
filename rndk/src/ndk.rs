@@ -270,6 +270,9 @@ impl Ndk {
         let min_platform_level = ndk_platforms["NDK_MIN_PLATFORM_LEVEL"]
             .parse::<u32>()
             .unwrap();
+        let max_platform_level = ndk_platforms["NDK_MAX_PLATFORM_LEVEL"]
+            .parse::<u32>()
+            .unwrap();
         let platforms_dir = sdk_path.join("platforms");
         let platforms: Vec<u32> = std::fs::read_dir(&platforms_dir)
             .or(Err(NdkError::PathNotFound(platforms_dir)))?
@@ -282,6 +285,22 @@ impl Ndk {
             })
             .filter(|level| *level >= min_platform_level)
             .collect();
+
+        let excess: Vec<&u32> = platforms
+            .iter()
+            .filter(|l| **l > max_platform_level)
+            .collect();
+        if !excess.is_empty() {
+            eprintln!(
+                "warning: SDK has platforms ({}) newer than NDK max platform level ({})",
+                excess
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                max_platform_level,
+            );
+        }
 
         if platforms.is_empty() {
             return Err(NdkError::NoPlatformFound);
