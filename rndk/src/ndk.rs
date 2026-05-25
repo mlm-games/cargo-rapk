@@ -270,10 +270,6 @@ impl Ndk {
         let min_platform_level = ndk_platforms["NDK_MIN_PLATFORM_LEVEL"]
             .parse::<u32>()
             .unwrap();
-        let max_platform_level = ndk_platforms["NDK_MAX_PLATFORM_LEVEL"]
-            .parse::<u32>()
-            .unwrap();
-
         let platforms_dir = sdk_path.join("platforms");
         let platforms: Vec<u32> = std::fs::read_dir(&platforms_dir)
             .or(Err(NdkError::PathNotFound(platforms_dir)))?
@@ -284,7 +280,7 @@ impl Ndk {
                 name.strip_prefix("android-")
                     .and_then(|api| api.parse::<u32>().ok())
             })
-            .filter(|level| (min_platform_level..=max_platform_level).contains(level))
+            .filter(|level| *level >= min_platform_level)
             .collect();
 
         if platforms.is_empty() {
