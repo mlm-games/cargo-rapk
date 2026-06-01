@@ -227,14 +227,22 @@ impl Ndk {
         let ndk_path = ndk_path.ok_or(NdkError::NdkNotFound)?;
 
         let build_tools_dir = sdk_path.join("build-tools");
-        let build_tools_version = std::fs::read_dir(&build_tools_dir)
-            .or(Err(NdkError::PathNotFound(build_tools_dir)))?
-            .filter_map(|path| path.ok())
-            .filter(|path| path.path().is_dir())
-            .filter_map(|path| path.file_name().into_string().ok())
-            .filter(|name| name.chars().next().unwrap().is_ascii_digit())
-            .max()
-            .ok_or(NdkError::BuildToolsNotFound)?;
+        let build_tools_version = if let Ok(pinned) = std::env::var("ANDROID_BUILD_TOOLS_VERSION") {
+            if build_tools_dir.join(&pinned).is_dir() {
+                pinned
+            } else {
+                return Err(NdkError::BuildToolsNotFound);
+            }
+        } else {
+            std::fs::read_dir(&build_tools_dir)
+                .or(Err(NdkError::PathNotFound(build_tools_dir)))?
+                .filter_map(|path| path.ok())
+                .filter(|path| path.path().is_dir())
+                .filter_map(|path| path.file_name().into_string().ok())
+                .filter(|name| name.chars().next().unwrap().is_ascii_digit())
+                .max()
+                .ok_or(NdkError::BuildToolsNotFound)?
+        };
 
         let build_tag = std::fs::read_to_string(ndk_path.join("source.properties"))
             .map_err(|e| NdkError::IoPathError(ndk_path.join("source.properties"), e))?;
