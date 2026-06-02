@@ -227,7 +227,7 @@ impl Ndk {
         let ndk_path = ndk_path.ok_or(NdkError::NdkNotFound)?;
 
         let build_tools_dir = sdk_path.join("build-tools");
-        let build_tools_version = if let Ok(pinned) = std::env::var("ANDROID_BUILD_TOOLS_VERSION") {
+        let build_tools_version = if let Ok(pinned) = std::env::var("ANDROID_BUILD_TOOLS") {
             if build_tools_dir.join(&pinned).is_dir() {
                 pinned
             } else {
@@ -557,6 +557,33 @@ impl Ndk {
     }
 
     pub fn d8(&self) -> Result<Command, NdkError> {
+        if let Ok(jar) = std::env::var("ANDROID_D8_JAR") {
+            let jar_path = PathBuf::from(&jar);
+            if jar_path.is_file() {
+                if let Ok(java) = which::which("java") {
+                    let mut cmd = Command::new(java);
+                    cmd.arg("-jar").arg(&jar_path);
+                    return Ok(cmd);
+                }
+                if let Ok(java_home) = std::env::var("JAVA_HOME") {
+                    let candidate = PathBuf::from(java_home).join("bin").join("java");
+                    if cfg!(target_os = "windows") {
+                        let candidate_exe = candidate.with_extension("exe");
+                        if candidate_exe.exists() {
+                            let mut cmd = Command::new(candidate_exe);
+                            cmd.arg("-jar").arg(&jar_path);
+                            return Ok(cmd);
+                        }
+                    }
+                    if candidate.exists() {
+                        let mut cmd = Command::new(candidate);
+                        cmd.arg("-jar").arg(&jar_path);
+                        return Ok(cmd);
+                    }
+                }
+                return Err(NdkError::CmdNotFound("java".to_string()));
+            }
+        }
         self.build_tool(bat!("d8"))
     }
 
