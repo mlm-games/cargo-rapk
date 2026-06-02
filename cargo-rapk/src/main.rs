@@ -35,8 +35,8 @@ struct Args {
     /// Produce an unsigned APK
     #[clap(long, env = "CARGO_RAPK_NO_SIGN")]
     unsigned: bool,
-    /// zipalign alignment in bytes (default: 4)
-    #[clap(long = "align", env = "CARGO_RAPK_ALIGN", default_value = "4")]
+    /// zipalign alignment in bytes (default: 16)
+    #[clap(long = "align", env = "CARGO_RAPK_ALIGN", default_value = "16")]
     align: u32,
     /// UNIX timestamp used for ZIP mtimes (defaults to SOURCE_DATE_EPOCH if present)
     #[clap(long = "timestamp")]
