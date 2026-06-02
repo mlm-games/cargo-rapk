@@ -560,26 +560,24 @@ impl Ndk {
         if let Ok(jar) = std::env::var("ANDROID_D8_JAR") {
             let jar_path = PathBuf::from(&jar);
             if jar_path.is_file() {
-                if let Ok(java) = which::which("java") {
-                    let mut cmd = Command::new(java);
-                    cmd.arg("-jar").arg(&jar_path);
-                    return Ok(cmd);
-                }
-                if let Ok(java_home) = std::env::var("JAVA_HOME") {
+                let java = which::which("java").or_else(|_| -> Result<PathBuf, ()> {
+                    let java_home = std::env::var("JAVA_HOME").map_err(|_| ())?;
                     let candidate = PathBuf::from(java_home).join("bin").join("java");
                     if cfg!(target_os = "windows") {
                         let candidate_exe = candidate.with_extension("exe");
-                        if candidate_exe.exists() {
-                            let mut cmd = Command::new(candidate_exe);
-                            cmd.arg("-jar").arg(&jar_path);
-                            return Ok(cmd);
+                        if candidate_exe.is_file() {
+                            return Ok(candidate_exe);
                         }
                     }
-                    if candidate.exists() {
-                        let mut cmd = Command::new(candidate);
-                        cmd.arg("-jar").arg(&jar_path);
-                        return Ok(cmd);
+                    if candidate.is_file() {
+                        return Ok(candidate);
                     }
+                    Err(())
+                });
+                if let Ok(java) = java {
+                    let mut cmd = Command::new(java);
+                    cmd.arg("-cp").arg(&jar_path).arg("com.android.tools.r8.D8");
+                    return Ok(cmd);
                 }
                 return Err(NdkError::CmdNotFound("java".to_string()));
             }
