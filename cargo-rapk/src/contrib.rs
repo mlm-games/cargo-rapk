@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::manifest::deserialize_one_or_many;
-use rndk::manifest::Activity;
+use rndk::manifest::{Activity, Service};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct AndroidContributions {
     pub(crate) java_sources: Vec<PathBuf>,
     pub(crate) activities: Vec<Activity>,
+    pub(crate) services: Vec<Service>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +67,8 @@ struct CargoRapkContributionMetadata {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_one_or_many")]
     activities: Vec<Activity>,
+    #[serde(default)]
+    services: Vec<Service>,
 }
 
 pub(crate) fn collect_android_contributions(
@@ -165,6 +168,8 @@ fn collect_from_metadata(metadata: CargoMetadata, manifest_path: &Path) -> Andro
     let mut java_source_set = HashSet::new();
     let mut activity_names = HashSet::new();
     let mut activities = Vec::new();
+    let mut service_names = HashSet::new();
+    let mut services = Vec::new();
 
     for package in metadata.packages {
         if !reachable_package_ids.is_empty() && !reachable_package_ids.contains(&package.id) {
@@ -200,11 +205,18 @@ fn collect_from_metadata(metadata: CargoMetadata, manifest_path: &Path) -> Andro
                 activities.push(activity);
             }
         }
+
+        for service in contrib.services {
+            if service_names.insert(service.name.clone()) {
+                services.push(service);
+            }
+        }
     }
 
     AndroidContributions {
         java_sources,
         activities,
+        services,
     }
 }
 

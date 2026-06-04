@@ -229,6 +229,18 @@ impl<'a> ApkBuilder<'a> {
             }
         }
 
+        let mut existing_service_names = manifest
+            .application
+            .service
+            .iter()
+            .map(|service| service.name.clone())
+            .collect::<HashSet<_>>();
+        for service in contrib.services {
+            if existing_service_names.insert(service.name.clone()) {
+                manifest.application.service.push(service);
+            }
+        }
+
         if manifest.application.activity.is_empty() {
             manifest
                 .application

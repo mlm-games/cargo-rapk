@@ -70,7 +70,7 @@ impl AndroidManifest {
     }
 }
 
-/// Android [application element](https://developer.android.com/guide/topics/manifest/application-element), containing one or more [`Activity`] elements.
+/// Android [application element](https://developer.android.com/guide/topics/manifest/application-element), containing one or more [`Activity`] and [`Service`] elements.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Application {
     #[serde(
@@ -111,6 +111,9 @@ pub struct Application {
     #[serde(default = "default_activities")]
     #[serde(deserialize_with = "deserialize_activities")]
     pub activity: Vec<Activity>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_services")]
+    pub service: Vec<Service>,
 }
 
 impl Default for Application {
@@ -125,6 +128,7 @@ impl Default for Application {
             uses_cleartext_traffic: None,
             meta_data: Vec::new(),
             activity: default_activities(),
+            service: Vec::new(),
         }
     }
 }
@@ -216,6 +220,95 @@ impl Default for Activity {
             meta_data: Default::default(),
             intent_filter: Default::default(),
         }
+    }
+}
+
+/// Android [service element](https://developer.android.com/guide/topics/manifest/service-element).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Service {
+    #[serde(rename(serialize = "@android:name"))]
+    pub name: String,
+    #[serde(
+        rename(serialize = "@android:exported"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exported: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:foregroundServiceType"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub foreground_service_type: Option<String>,
+    #[serde(
+        rename(serialize = "@android:label"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub label: Option<String>,
+    #[serde(
+        rename(serialize = "@android:icon"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub icon: Option<String>,
+    #[serde(
+        rename(serialize = "@android:permission"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission: Option<String>,
+    #[serde(
+        rename(serialize = "@android:process"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process: Option<String>,
+    #[serde(
+        rename(serialize = "@android:description"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<String>,
+    #[serde(
+        rename(serialize = "@android:directBootAware"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub direct_boot_aware: Option<bool>,
+
+    #[serde(rename(serialize = "meta-data"))]
+    #[serde(default)]
+    pub meta_data: Vec<MetaData>,
+    #[serde(rename(serialize = "intent-filter"))]
+    #[serde(default)]
+    pub intent_filter: Vec<IntentFilter>,
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            exported: None,
+            foreground_service_type: None,
+            label: None,
+            icon: None,
+            permission: None,
+            process: None,
+            description: None,
+            direct_boot_aware: None,
+            meta_data: Vec::new(),
+            intent_filter: Vec::new(),
+        }
+    }
+}
+
+fn deserialize_services<'de, D>(deserializer: D) -> Result<Vec<Service>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        One(T),
+        Many(Vec<T>),
+    }
+
+    match OneOrMany::<Service>::deserialize(deserializer)? {
+        OneOrMany::One(service) => Ok(vec![service]),
+        OneOrMany::Many(services) => Ok(services),
     }
 }
 
