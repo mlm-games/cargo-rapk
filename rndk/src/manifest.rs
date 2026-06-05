@@ -224,8 +224,7 @@ impl Default for Activity {
 }
 
 /// Android [service element](https://developer.android.com/guide/topics/manifest/service-element).
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct Service {
     #[serde(rename(serialize = "@android:name"))]
     pub name: String,
@@ -277,7 +276,6 @@ pub struct Service {
     #[serde(default)]
     pub intent_filter: Vec<IntentFilter>,
 }
-
 
 fn deserialize_services<'de, D>(deserializer: D) -> Result<Vec<Service>, D::Error>
 where
