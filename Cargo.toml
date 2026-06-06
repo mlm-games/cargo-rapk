@@ -3,7 +3,7 @@ resolver = "3"
 members = ["rndk", "ndk-examples", "cargo-rapk"]
 
 [workspace.package]
-version = "0.16.0"
+version = "0.16.1"
 edition = "2024"
 
 [workspace.dependencies]
