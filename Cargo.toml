@@ -7,4 +7,4 @@ version = "0.16.1"
 edition = "2024"
 
 [workspace.dependencies]
-rndk = { version = "0.16.0", path = "rndk" }
+rndk = { version = "0.16.1", path = "rndk" }
