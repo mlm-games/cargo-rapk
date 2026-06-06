@@ -355,19 +355,40 @@ where
 /// Android [intent filter data element](https://developer.android.com/guide/topics/manifest/data-element).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct IntentFilterData {
-    #[serde(rename(serialize = "@android:scheme"), skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename(serialize = "@android:scheme"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub scheme: Option<String>,
-    #[serde(rename(serialize = "@android:host"), skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename(serialize = "@android:host"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host: Option<String>,
-    #[serde(rename(serialize = "@android:port"), skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename(serialize = "@android:port"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub port: Option<String>,
-    #[serde(rename(serialize = "@android:path"), skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename(serialize = "@android:path"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub path: Option<String>,
-    #[serde(rename(serialize = "@android:pathPattern"), skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename(serialize = "@android:pathPattern"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub path_pattern: Option<String>,
-    #[serde(rename(serialize = "@android:pathPrefix"), skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename(serialize = "@android:pathPrefix"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub path_prefix: Option<String>,
-    #[serde(rename(serialize = "@android:mimeType"), skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename(serialize = "@android:mimeType"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mime_type: Option<String>,
 }
 
@@ -477,7 +498,10 @@ pub struct Queries {
 /// Android [uses-sdk element](https://developer.android.com/guide/topics/manifest/uses-sdk-element).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Sdk {
-    #[serde(rename(serialize = "@android:minSdkVersion"))]
+    #[serde(
+        rename(serialize = "@android:minSdkVersion"),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_sdk_version: Option<u32>,
     #[serde(
         rename(serialize = "@android:targetSdkVersion"),
