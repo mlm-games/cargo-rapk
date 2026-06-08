@@ -308,6 +308,7 @@ impl<'a> UnsignedApk<'a> {
 pub struct Apk {
     path: PathBuf,
     package_name: String,
+    activity_name: String,
     ndk: Ndk,
     reverse_port_forward: HashMap<String, String>,
 }
@@ -315,9 +316,17 @@ pub struct Apk {
 impl Apk {
     pub fn from_config(config: &ApkConfig) -> Self {
         let ndk = config.ndk.clone();
+        let activity_name = config
+            .manifest
+            .application
+            .activity
+            .first()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "android.app.NativeActivity".to_string());
         Self {
             path: config.apk(),
             package_name: config.manifest.package.clone(),
+            activity_name,
             ndk,
             reverse_port_forward: config.reverse_port_forward.clone(),
         }
@@ -355,8 +364,10 @@ impl Apk {
             .arg("start")
             .arg("-a")
             .arg("android.intent.action.MAIN")
+            .arg("-c")
+            .arg("android.intent.category.LAUNCHER")
             .arg("-n")
-            .arg(format!("{}/android.app.NativeActivity", self.package_name));
+            .arg(format!("{}/{}", self.package_name, self.activity_name));
 
         if !adb.status()?.success() {
             return Err(NdkError::CmdFailed(Box::new(adb)));
