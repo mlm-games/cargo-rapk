@@ -672,6 +672,25 @@ impl Ndk {
         Ok(Command::new(kotlinc_path))
     }
 
+    /// Returns the path to `kotlin-stdlib.jar` bundled with the Kotlin compiler,
+    pub fn kotlin_stdlib_jar(&self) -> Result<PathBuf, NdkError> {
+        // Ensure it is available (downloads if needed, but the command itself
+        // is not executed).
+        let _ = self.kotlinc()?;
+
+        let cache_dir = self.kotlin_cache_dir();
+        let stdlib_jar = cache_dir
+            .join("kotlinc")
+            .join("lib")
+            .join("kotlin-stdlib.jar");
+        if !stdlib_jar.exists() {
+            return Err(NdkError::CmdNotFound(
+                "kotlin-stdlib.jar not found in kotlinc distribution".to_string(),
+            ));
+        }
+        Ok(stdlib_jar)
+    }
+
     pub fn debug_key(&self) -> Result<Key, NdkError> {
         let path = self.android_user_home()?.join("debug.keystore");
         let password = DEFAULT_DEV_KEYSTORE_PASSWORD.to_owned();

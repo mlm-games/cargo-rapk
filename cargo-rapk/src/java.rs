@@ -139,6 +139,16 @@ pub(crate) fn compile_java_sources(
         classpath.push_str(&jar_file.to_string_lossy());
     }
 
+    // If Kotlin sources are present, add kotlin-stdlib from the compiler distribution.
+    let kotlin_stdlib_jar = if !kt_files.is_empty() {
+        let j = ndk.kotlin_stdlib_jar()?;
+        classpath.push(path_separator);
+        classpath.push_str(&j.to_string_lossy());
+        Some(j)
+    } else {
+        None
+    };
+
     // Compile sources
     if !java_files.is_empty() {
         let mut javac = ndk.javac()?;
@@ -192,6 +202,9 @@ pub(crate) fn compile_java_sources(
     }
     for jar_file in &jar_files {
         d8.arg(jar_file);
+    }
+    if let Some(ref stdlib_jar) = kotlin_stdlib_jar {
+        d8.arg(stdlib_jar);
     }
     if !d8.status()?.success() {
         return Err(NdkError::CmdFailed(Box::new(d8)).into());
