@@ -628,8 +628,7 @@ impl Ndk {
             return Ok(Command::new(kotlinc_path));
         }
         Err(NdkError::CmdNotFound(
-            "kotlinc not found. Install Kotlin compiler or set KOTLIN_COMPILER env var"
-                .to_string(),
+            "kotlinc not found. Install Kotlin compiler or set KOTLIN_COMPILER env var".to_string(),
         ))
     }
 
