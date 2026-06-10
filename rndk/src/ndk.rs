@@ -1,7 +1,7 @@
 use crate::error::NdkError;
 use crate::target::Target;
 use std::collections::HashMap;
-use std::fs::{File, create_dir_all, read_dir, read_to_string};
+use std::fs::{create_dir_all, read_dir, read_to_string};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -611,18 +611,15 @@ impl Ndk {
     }
 
     pub fn kotlinc(&self) -> Result<Command, NdkError> {
-        // Check PATH first
         if let Ok(path) = which::which("kotlinc") {
             return Ok(Command::new(path));
         }
-        // Check KOTLIN_COMPILER env var
         if let Ok(path_str) = std::env::var("KOTLIN_COMPILER") {
             let candidate = PathBuf::from(&path_str);
             if candidate.exists() {
                 return Ok(Command::new(candidate));
             }
         }
-        // Check cached download
         let cache_dir = self.kotlin_cache_dir();
         let kotlinc_path = cache_dir.join("kotlinc").join("bin").join("kotlinc");
         #[cfg(target_os = "windows")]
@@ -630,65 +627,52 @@ impl Ndk {
         if kotlinc_path.exists() {
             return Ok(Command::new(kotlinc_path));
         }
-        // Download Kotlin compiler
-        let kotlin_version = "1.9.24";
-        let url = format!(
-            "https://github.com/JetBrains/kotlin/releases/download/v{kotlin_version}/kotlin-compiler-{kotlin_version}.zip"
-        );
-        let zip_path = cache_dir.join("kotlin-compiler.zip");
-
-        create_dir_all(&cache_dir)
-            .map_err(|e| NdkError::CmdNotFound(format!("kotlinc: cannot create cache dir: {e}")))?;
-
-        log::warn!("kotlinc not on PATH, downloading Kotlin compiler {kotlin_version}...");
-
-        let response = ureq::get(&url)
-            .call()
-            .map_err(|e| NdkError::CmdNotFound(format!("kotlinc: download failed: {e}")))?;
-
-        let mut reader = response.into_body().into_reader();
-        let mut file = File::create(&zip_path)
-            .map_err(|e| NdkError::CmdNotFound(format!("kotlinc: cannot write zip: {e}")))?;
-
-        use std::io::copy;
-        copy(&mut reader, &mut file)
-            .map_err(|e| NdkError::CmdNotFound(format!("kotlinc: download write error: {e}")))?;
-
-        log::warn!("extracting Kotlin compiler...");
-        let zip_file = File::open(&zip_path)
-            .map_err(|e| NdkError::CmdNotFound(format!("kotlinc: cannot open zip: {e}")))?;
-        let mut archive = zip::ZipArchive::new(zip_file)
-            .map_err(|e| NdkError::CmdNotFound(format!("kotlinc: invalid zip: {e}")))?;
-        archive
-            .extract(&cache_dir)
-            .map_err(|e| NdkError::CmdNotFound(format!("kotlinc: extract failed: {e}")))?;
-
-        if !kotlinc_path.exists() {
-            return Err(NdkError::CmdNotFound(
-                "kotlinc: extracted successfully but kotlinc binary not found".to_string(),
-            ));
-        }
-
-        Ok(Command::new(kotlinc_path))
+        Err(NdkError::CmdNotFound(
+            "kotlinc not found. Install Kotlin compiler or set KOTLIN_COMPILER env var"
+                .to_string(),
+        ))
     }
 
-    /// Returns the path to `kotlin-stdlib.jar` bundled with the Kotlin compiler,
     pub fn kotlin_stdlib_jar(&self) -> Result<PathBuf, NdkError> {
-        // Ensure it is available (downloads if needed, but the command itself
-        // is not executed).
-        let _ = self.kotlinc()?;
-
-        let cache_dir = self.kotlin_cache_dir();
-        let stdlib_jar = cache_dir
+        let cache_jar = self
+            .kotlin_cache_dir()
             .join("kotlinc")
             .join("lib")
             .join("kotlin-stdlib.jar");
-        if !stdlib_jar.exists() {
-            return Err(NdkError::CmdNotFound(
-                "kotlin-stdlib.jar not found in kotlinc distribution".to_string(),
-            ));
+        if cache_jar.exists() {
+            return Ok(cache_jar);
         }
-        Ok(stdlib_jar)
+        if let Ok(path) = which::which("kotlinc") {
+            let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+            let candidate = resolved
+                .parent()
+                .ok_or_else(|| NdkError::CmdNotFound("kotlinc".to_string()))?
+                .parent()
+                .ok_or_else(|| NdkError::CmdNotFound("kotlinc".to_string()))?
+                .join("lib")
+                .join("kotlin-stdlib.jar");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        if let Ok(path_str) = std::env::var("KOTLIN_COMPILER") {
+            let candidate = PathBuf::from(&path_str);
+            let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+            if let Some(parent) = resolved.parent() {
+                let jar = parent
+                    .parent()
+                    .map(|p| p.join("lib").join("kotlin-stdlib.jar"));
+                if let Some(jar) = jar {
+                    if jar.exists() {
+                        return Ok(jar);
+                    }
+                }
+            }
+        }
+        Err(NdkError::CmdNotFound(
+            "kotlin-stdlib.jar not found. Install Kotlin compiler or set KOTLIN_COMPILER env var"
+                .to_string(),
+        ))
     }
 
     pub fn debug_key(&self) -> Result<Key, NdkError> {

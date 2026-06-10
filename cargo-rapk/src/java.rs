@@ -139,12 +139,9 @@ pub(crate) fn compile_java_sources(
         classpath.push_str(&jar_file.to_string_lossy());
     }
 
-    // If Kotlin sources are present, add kotlin-stdlib from the compiler distribution.
+    // `-no-stdlib` is opt-in
     let kotlin_stdlib_jar = if !kt_files.is_empty() {
-        let j = ndk.kotlin_stdlib_jar()?;
-        classpath.push(path_separator);
-        classpath.push_str(&j.to_string_lossy());
-        Some(j)
+        Some(ndk.kotlin_stdlib_jar()?)
     } else {
         None
     };
