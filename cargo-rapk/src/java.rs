@@ -4,6 +4,34 @@ use rndk::ndk::Ndk;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn collect_kotlin_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+    let mut kt_files = Vec::new();
+    for source_dir in source_dirs {
+        if !source_dir.exists() {
+            return Err(NdkError::PathNotFound(source_dir.clone()).into());
+        }
+        if !source_dir.is_dir() {
+            return Err(NdkError::PathNotFound(source_dir.clone()).into());
+        }
+
+        let mut stack = vec![source_dir.clone()];
+        while let Some(current_dir) = stack.pop() {
+            for entry in fs::read_dir(&current_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("kt") {
+                    kt_files.push(path);
+                }
+            }
+        }
+    }
+
+    kt_files.sort();
+    Ok(kt_files)
+}
+
 fn collect_java_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     let mut java_files = Vec::new();
     for source_dir in source_dirs {
@@ -84,8 +112,9 @@ pub(crate) fn compile_java_sources(
     target_sdk_version: u32,
 ) -> Result<Vec<PathBuf>, Error> {
     let java_files = collect_java_files(source_dirs)?;
+    let kt_files = collect_kotlin_files(source_dirs)?;
     let jar_files = collect_jar_files(source_dirs)?;
-    if java_files.is_empty() && jar_files.is_empty() {
+    if java_files.is_empty() && kt_files.is_empty() && jar_files.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -110,23 +139,41 @@ pub(crate) fn compile_java_sources(
         classpath.push_str(&jar_file.to_string_lossy());
     }
 
-    let mut javac = ndk.javac()?;
-    javac
-        .arg("-encoding")
-        .arg("UTF-8")
-        .arg("-source")
-        .arg("8")
-        .arg("-target")
-        .arg("8")
-        .arg("-classpath")
-        .arg(&classpath)
-        .arg("-d")
-        .arg(&classes_dir);
-    for java_file in &java_files {
-        javac.arg(java_file);
+    // Compile sources
+    if !java_files.is_empty() {
+        let mut javac = ndk.javac()?;
+        javac
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-source")
+            .arg("8")
+            .arg("-target")
+            .arg("8")
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("-d")
+            .arg(&classes_dir);
+        for java_file in &java_files {
+            javac.arg(java_file);
+        }
+        if !javac.status()?.success() {
+            return Err(NdkError::CmdFailed(Box::new(javac)).into());
+        }
     }
-    if !java_files.is_empty() && !javac.status()?.success() {
-        return Err(NdkError::CmdFailed(Box::new(javac)).into());
+
+    if !kt_files.is_empty() {
+        let mut kotlinc = ndk.kotlinc()?;
+        kotlinc
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("-d")
+            .arg(&classes_dir);
+        for kt_file in &kt_files {
+            kotlinc.arg(kt_file);
+        }
+        if !kotlinc.status()?.success() {
+            return Err(NdkError::CmdFailed(Box::new(kotlinc)).into());
+        }
     }
 
     let class_files = collect_class_files(&classes_dir)?;

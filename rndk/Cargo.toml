@@ -18,4 +18,6 @@ quick-xml = { version = "0.38", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 which = "8"
+ureq = "3"
 zip = { version = "6", default-features = false, features = ["deflate"] }
+log = "0.4.32"
