@@ -155,10 +155,6 @@ pub(crate) fn compile_java_sources(
         javac
             .arg("-encoding")
             .arg("UTF-8")
-            .arg("-source")
-            .arg("8")
-            .arg("-target")
-            .arg("8")
             .arg("-classpath")
             .arg(&classpath)
             .arg("-d")
