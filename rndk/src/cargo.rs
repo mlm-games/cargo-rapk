@@ -9,6 +9,8 @@ pub fn cargo_ndk(
     target: Target,
     sdk_version: u32,
     target_dir: impl AsRef<Path>,
+    deterministic: bool,
+    source_date_epoch: Option<u64>,
 ) -> Result<Command, NdkError> {
     let triple = target.rust_triple();
     let clang_target = format!("--target={}{}", target.ndk_llvm_triple(), sdk_version);
@@ -95,7 +97,7 @@ pub fn cargo_ndk(
         );
     }
 
-    if std::env::var("CARGO_RAPK_DETERMINISTIC").ok().as_deref() == Some("1") {
+    if deterministic {
         let pwd = std::env::current_dir().ok();
         let cargo_home = std::env::var("CARGO_HOME")
             .ok()
@@ -121,6 +123,11 @@ pub fn cargo_ndk(
         rustflags.push_str(SEP);
         rustflags.push_str("-Ccodegen-units=1");
         cargo.env("CARGO_INCREMENTAL", "0");
+    }
+
+    cargo.env("CARGO_RAPK_DETERMINISTIC", if deterministic { "1" } else { "0" });
+    if let Some(ts) = source_date_epoch {
+        cargo.env("SOURCE_DATE_EPOCH", ts.to_string());
     }
 
     // Set env exactly once, after all edits

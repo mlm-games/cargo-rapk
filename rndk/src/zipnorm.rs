@@ -1,8 +1,17 @@
 use std::io::{Cursor, Write};
+use time::{OffsetDateTime, PrimitiveDateTime};
 use zip::{
     CompressionMethod, DateTime, ZipArchive, ZipWriter,
     write::{ExtendedFileOptions, FileOptions},
 };
+
+/// Convert a Unix timestamp (seconds since epoch) to a DOS [`DateTime`].
+fn unix_ts_to_dos(ts: u64) -> DateTime {
+    let odt = OffsetDateTime::from_unix_timestamp(ts as i64)
+        .expect("timestamp out of range for OffsetDateTime");
+    let pdt = PrimitiveDateTime::new(odt.date(), odt.time());
+    DateTime::try_from(pdt).unwrap_or_default()
+}
 
 /// Normalize a ZIP: set deterministic mtimes, strip variable extra fields, and
 /// write entries in lexicographic order for both local headers and central dir.
@@ -16,7 +25,7 @@ pub fn normalize_zip_in_place(
     Ok(())
 }
 
-pub fn normalize_zip(data: &[u8], _ts: Option<u64>) -> Result<Vec<u8>, std::io::Error> {
+pub fn normalize_zip(data: &[u8], ts: Option<u64>) -> Result<Vec<u8>, std::io::Error> {
     let mut src = ZipArchive::new(Cursor::new(data))?;
 
     // Deterministic order: lexicographic filenames
@@ -25,8 +34,11 @@ pub fn normalize_zip(data: &[u8], _ts: Option<u64>) -> Result<Vec<u8>, std::io::
         .collect();
     names.sort();
 
-    // Fixed DOS time (1980-01-01 00:00:00)
-    let dos_time = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("valid DOS datetime");
+    // Use the provided timestamp, or fall back to 1980-01-01 00:00:00
+    let dos_time = ts.map_or_else(
+        || DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("valid DOS datetime"),
+        unix_ts_to_dos,
+    );
 
     let cursor = Cursor::new(Vec::with_capacity(data.len()));
     let mut writer = ZipWriter::new(cursor);

@@ -13,6 +13,8 @@ const GET_DEVICES_OUTPUTS: jni::sys::jint = 2;
 fn enumerate_audio_devices() -> Result<(), Box<dyn std::error::Error>> {
     // Create a VM for executing Java calls
     let ctx = ndk_context::android_context();
+    // SAFETY: `ndk_context::android_context()` returns valid JVM and context
+    // pointers that are guaranteed to be non-null and stable.
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }?;
     let context = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
     let mut env = vm.attach_current_thread()?;

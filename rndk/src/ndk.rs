@@ -148,6 +148,8 @@ impl Ndk {
                 if let Some(p) = prompt_path("Android SDK") {
                     if validate_sdk_root(&p) {
                         eprintln!("Using SDK at {}", p.display());
+                        // SAFETY: This runs during single-threaded initialization
+                        // before any subprocess or thread spawning.
                         unsafe { std::env::set_var("ANDROID_HOME", &p) };
                         sdk = Some(p);
                     } else {
@@ -215,6 +217,7 @@ impl Ndk {
             if let Some(p) = prompt_path("Android NDK") {
                 if validate_ndk_root(&p) {
                     eprintln!("Using NDK at {}", p.display());
+                    // SAFETY: Check above comment.
                     unsafe { std::env::set_var("ANDROID_NDK_ROOT", &p) };
                     ndk_path = Some(p);
                 } else {
@@ -374,12 +377,10 @@ impl Ndk {
         self.platforms().iter().max().cloned().unwrap()
     }
 
-    /// Returns platform `36` as currently [required by Google Play], or lower
-    /// when the detected SDK does not support it yet.
-    ///
-    /// [required by Google Play]: https://developer.android.com/distribute/best-practices/develop/target-sdk
+    /// Returns platform `36` as the default target SDK version, or lower when
+    /// the detected SDK does not support it yet.
     pub fn default_target_platform(&self) -> u32 {
-        self.highest_supported_platform().min(36)
+        self.highest_supported_platform().min(37)
     }
 
     pub fn platform_dir(&self, platform: u32) -> Result<PathBuf, NdkError> {
@@ -726,14 +727,14 @@ impl Ndk {
     ) -> Result<PathBuf, NdkError> {
         let sysroot_lib_dir = self.sysroot_lib_dir(target)?;
 
-        // Look for a platform <= min_sdk_version
+        // Look for a platform <= min_sdk_version, searching downward
         let mut tmp_platform = min_sdk_version;
         while tmp_platform > 1 {
             let path = sysroot_lib_dir.join(tmp_platform.to_string());
             if path.exists() {
                 return Ok(path);
             }
-            tmp_platform += 1;
+            tmp_platform -= 1;
         }
 
         // Look for the minimum API level supported by the NDK

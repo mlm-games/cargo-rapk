@@ -9,7 +9,7 @@ keywords = ["android", "ndk", "apk"]
 documentation = "https://docs.rs/cargo-rapk"
 homepage = "https://github.com/mlm-games/cargo-rapk"
 repository = "https://github.com/mlm-games/cargo-rapk"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0.99"

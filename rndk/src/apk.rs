@@ -277,12 +277,14 @@ impl<'a> UnsignedApk<'a> {
 
     pub fn sign(self, key: Key) -> Result<Apk, NdkError> {
         let mut apksigner = self.0.build_tool(bat!("apksigner"))?;
+
+        apksigner.env("CARGO_RAPK_KS_PASS", &key.password);
         apksigner
             .arg("sign")
             .arg("--ks")
             .arg(&key.path)
             .arg("--ks-pass")
-            .arg(format!("pass:{}", &key.password));
+            .arg("env:CARGO_RAPK_KS_PASS");
 
         if self.0.normalize_zip {
             apksigner
