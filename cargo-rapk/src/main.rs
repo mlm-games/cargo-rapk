@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use cargo_rapk::{ApkBuilder, Error};
 use cargo_subcommand::Subcommand;
 use clap::{CommandFactory, FromArgMatches, Parser};
+use rndk::apk::BuildFormat;
 
 #[derive(Parser)]
 struct Cmd {
@@ -27,6 +28,10 @@ struct Args {
     /// Use device with the given serial (see `adb devices`)
     #[clap(short, long)]
     device: Option<String>,
+
+    /// Output format: "apk" (default) or "aab"
+    #[clap(long, default_value = "apk", value_parser = ["apk", "aab"])]
+    format: String,
 
     // Reproducibility knobs
     /// Enable deterministic (reproducible) build settings
@@ -164,6 +169,11 @@ fn main() -> anyhow::Result<()> {
         ($args:expr, $cmd:ident, $builder:ident) => {
             let $cmd = Subcommand::new($args.subcommand_args)?;
             let mut $builder = ApkBuilder::from_subcommand(&$cmd, $args.device)?;
+            let fmt = match $args.format.as_str() {
+                "aab" => BuildFormat::Aab,
+                _ => BuildFormat::Apk,
+            };
+            $builder.set_format(fmt);
             $builder.set_repro_flags(
                 $args.deterministic,
                 $args.unsigned,

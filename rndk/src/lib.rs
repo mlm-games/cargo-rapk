@@ -27,6 +27,7 @@ macro_rules! cmd {
 }
 
 pub mod apk;
+pub use apk::BuildFormat;
 pub mod cargo;
 pub mod dylibs;
 pub mod error;

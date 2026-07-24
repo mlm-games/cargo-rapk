@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::java::compile_java_sources;
 use crate::manifest::{Inheritable, Manifest, Root};
 use cargo_subcommand::{Artifact, ArtifactType, CrateType, Profile, Subcommand};
-use rndk::apk::{Apk, ApkConfig};
+use rndk::apk::{Apk, ApkConfig, BuildFormat};
 use rndk::cargo::{VersionCode, cargo_ndk};
 use rndk::error::NdkError;
 use rndk::manifest::{IntentFilter, MetaData};
@@ -44,6 +44,7 @@ pub struct ApkBuilder<'a> {
     build_targets: Vec<Target>,
     device_serial: Option<String>,
     repro: ReproCfg,
+    format: BuildFormat,
 }
 
 impl<'a> ApkBuilder<'a> {
@@ -130,7 +131,12 @@ impl<'a> ApkBuilder<'a> {
             build_targets,
             device_serial,
             repro: ReproCfg::default(),
+            format: BuildFormat::Apk,
         })
+    }
+
+    pub fn set_format(&mut self, format: BuildFormat) {
+        self.format = format;
     }
 
     pub fn set_repro_flags(
@@ -318,8 +324,7 @@ impl<'a> ApkBuilder<'a> {
             disable_aapt_compression: is_debug_profile,
             strip: self.manifest.strip,
             reverse_port_forward: self.manifest.reverse_port_forward.clone(),
-
-            // reproducibility
+            format: self.format,
             align: self.repro.align,
             normalize_zip: self.repro.deterministic && !self.repro.no_normalize_zip,
             zip_timestamp: self.repro.ts_unix,
@@ -384,9 +389,13 @@ impl<'a> ApkBuilder<'a> {
         let unsigned = apk.add_pending_libs_and_align()?;
 
         if self.repro.unsigned {
+            let ext = match self.format {
+                BuildFormat::Apk => "APK",
+                BuildFormat::Aab => "AAB",
+            };
             eprintln!(
-                "--unsigned set; producing unsigned APK at {}",
-                config.apk().display()
+                "--unsigned set; producing unsigned {ext} at {}",
+                config.output_path().display()
             );
             return Ok(rndk::apk::Apk::from_config(unsigned.config()));
         }
@@ -429,7 +438,7 @@ impl<'a> ApkBuilder<'a> {
 
         println!(
             "Signing `{}` with keystore `{}`",
-            config.apk().display(),
+            config.output_path().display(),
             signing_key.path.display()
         );
         Ok(unsigned.sign(signing_key)?)
