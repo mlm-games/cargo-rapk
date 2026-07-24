@@ -168,7 +168,11 @@ impl<'a> ApkBuilder<'a> {
                 self.min_sdk_version(),
                 self.cmd.target_dir(),
                 self.repro.deterministic,
-                if self.repro.deterministic { self.repro.ts_unix } else { None },
+                if self.repro.deterministic {
+                    self.repro.ts_unix
+                } else {
+                    None
+                },
             )?;
             cargo.arg("check");
             if self.cmd.target().is_none() {
@@ -358,7 +362,11 @@ impl<'a> ApkBuilder<'a> {
                 self.min_sdk_version(),
                 self.cmd.target_dir(),
                 self.repro.deterministic,
-                if self.repro.deterministic { self.repro.ts_unix } else { None },
+                if self.repro.deterministic {
+                    self.repro.ts_unix
+                } else {
+                    None
+                },
             )?;
             cargo.arg("build");
             if self.cmd.target().is_none() {
@@ -486,7 +494,11 @@ impl<'a> ApkBuilder<'a> {
                 self.min_sdk_version(),
                 self.cmd.target_dir(),
                 self.repro.deterministic,
-                if self.repro.deterministic { self.repro.ts_unix } else { None },
+                if self.repro.deterministic {
+                    self.repro.ts_unix
+                } else {
+                    None
+                },
             )?;
             cargo.arg(cargo_cmd);
             self.cmd.args().apply(&mut cargo);

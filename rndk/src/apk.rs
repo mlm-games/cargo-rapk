@@ -10,8 +10,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, result::ZipError};
 use zip::write::{ExtendedFileOptions, FileOptions};
+use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, result::ZipError};
 
 /// Output format for the Android package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +151,8 @@ impl ApkConfig {
             .unwrap_or_else(|| self.ndk.default_target_platform());
 
         let mut aapt2 = self.build_tool(bin!("aapt2"))?;
-        aapt2.arg("link")
+        aapt2
+            .arg("link")
             .arg("--proto-format")
             .arg("-o")
             .arg(self.build_dir.join("base.apk"))
@@ -164,7 +165,12 @@ impl ApkConfig {
             let compiled = self.build_dir.join("compiled_res");
             fs::create_dir_all(&compiled)?;
             let mut compile = self.build_tool(bin!("aapt2"))?;
-            compile.arg("compile").arg("-o").arg(&compiled).arg("--dir").arg(res);
+            compile
+                .arg("compile")
+                .arg("-o")
+                .arg(&compiled)
+                .arg("--dir")
+                .arg(res);
             if !compile.status()?.success() {
                 return Err(NdkError::CmdFailed(Box::new(compile)));
             }
@@ -402,8 +408,7 @@ impl<'a> UnalignedApk<'a> {
             let opts: FileOptions<'_, ExtendedFileOptions> = FileOptions::default()
                 .compression_method(CompressionMethod::Stored)
                 .last_modified_time(dos_time);
-            zip.start_file("BundleConfig.pb", opts)
-                .map_err(zip_to_io)?;
+            zip.start_file("BundleConfig.pb", opts).map_err(zip_to_io)?;
             zip.write_all(BUNDLE_CONFIG_PB)?;
         }
 
@@ -412,15 +417,13 @@ impl<'a> UnalignedApk<'a> {
         if base_apk.exists() {
             let data = fs::read(&base_apk)?;
             let cursor = std::io::Cursor::new(data);
-            let mut base_archive = ZipArchive::new(cursor)
-                .map_err(zip_to_io)?;
+            let mut base_archive = ZipArchive::new(cursor).map_err(zip_to_io)?;
             let mut names: Vec<String> = (0..base_archive.len())
                 .filter_map(|i| base_archive.by_index(i).ok().map(|f| f.name().to_string()))
                 .collect();
             names.sort();
             for name in names {
-                let mut file = base_archive.by_name(&name)
-                    .map_err(zip_to_io)?;
+                let mut file = base_archive.by_name(&name).map_err(zip_to_io)?;
                 let method = match file.compression() {
                     CompressionMethod::Stored => CompressionMethod::Stored,
                     _ => CompressionMethod::Deflated,
@@ -435,8 +438,7 @@ impl<'a> UnalignedApk<'a> {
                 } else {
                     format!("base/{name}")
                 };
-                zip.start_file(&aab_path, opts)
-                    .map_err(zip_to_io)?;
+                zip.start_file(&aab_path, opts).map_err(zip_to_io)?;
                 zip.write_all(&buf)?;
             }
         }
@@ -445,10 +447,7 @@ impl<'a> UnalignedApk<'a> {
         let mut entries: Vec<_> = self.pending_entries.into_iter().collect();
         entries.sort();
         for entry in entries {
-            let rel_src = entry
-                .strip_prefix("base/")
-                .unwrap_or(&entry)
-                .to_string();
+            let rel_src = entry.strip_prefix("base/").unwrap_or(&entry).to_string();
             let src = self.config.build_dir.join(&rel_src);
             let ext = Path::new(&entry)
                 .extension()
@@ -467,22 +466,17 @@ impl<'a> UnalignedApk<'a> {
             } else {
                 entry.clone()
             };
-            zip.start_file(&aab_entry, opts)
-                .map_err(zip_to_io)?;
+            zip.start_file(&aab_entry, opts).map_err(zip_to_io)?;
             let mut f = fs::File::open(&src)?;
             std::io::copy(&mut f, &mut zip)?;
         }
 
-        zip.finish()
-            .map_err(zip_to_io)?;
+        zip.finish().map_err(zip_to_io)?;
 
         // Normalize AAB zip if requested
         if self.config.normalize_zip {
-            super::zipnorm::normalize_zip_in_place(
-                self.config.aab(),
-                self.config.zip_timestamp,
-            )
-            .map_err(|e| NdkError::IoPathError(self.config.aab(), e))?;
+            super::zipnorm::normalize_zip_in_place(self.config.aab(), self.config.zip_timestamp)
+                .map_err(|e| NdkError::IoPathError(self.config.aab(), e))?;
         }
 
         Ok(UnsignedApk(self.config))

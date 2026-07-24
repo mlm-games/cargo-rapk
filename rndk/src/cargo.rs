@@ -125,7 +125,10 @@ pub fn cargo_ndk(
         cargo.env("CARGO_INCREMENTAL", "0");
     }
 
-    cargo.env("CARGO_RAPK_DETERMINISTIC", if deterministic { "1" } else { "0" });
+    cargo.env(
+        "CARGO_RAPK_DETERMINISTIC",
+        if deterministic { "1" } else { "0" },
+    );
     if let Some(ts) = source_date_epoch {
         cargo.env("SOURCE_DATE_EPOCH", ts.to_string());
     }
