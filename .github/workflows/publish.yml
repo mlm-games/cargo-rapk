@@ -24,6 +24,6 @@ jobs:
       bump-type: ${{ inputs.bump_type }}
       create-release: true
       workspace-publish: true
-      workspace-exclude: "rndk ndk-examples"
+      workspace-exclude: "ndk-examples"
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
