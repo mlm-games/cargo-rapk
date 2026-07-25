@@ -95,13 +95,11 @@ fn list_libs(path: &Path) -> Result<HashSet<String>, NdkError> {
     let entries = std::fs::read_dir(path)?;
     for entry in entries {
         let entry = entry?;
-        if !entry.path().is_dir() {
-            if let Some(file_name) = entry.file_name().to_str() {
-                if file_name.ends_with(".so") {
+        if !entry.path().is_dir()
+            && let Some(file_name) = entry.file_name().to_str()
+                && file_name.ends_with(".so") {
                     libs.insert(file_name.to_string());
                 }
-            }
-        }
     }
     Ok(libs)
 }

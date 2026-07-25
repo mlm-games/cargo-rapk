@@ -176,7 +176,7 @@ impl ApkConfig {
             }
             for entry in fs::read_dir(&compiled)? {
                 let entry = entry?;
-                if entry.path().extension().map_or(false, |e| e == "flat") {
+                if entry.path().extension().is_some_and(|e| e == "flat") {
                     aapt2.arg("-R").arg(entry.path());
                 }
             }
@@ -524,7 +524,7 @@ impl<'a> UnsignedApk<'a> {
 fn zip_to_io(e: ZipError) -> std::io::Error {
     match e {
         ZipError::Io(ioe) => ioe,
-        other => std::io::Error::new(std::io::ErrorKind::Other, other.to_string()),
+        other => std::io::Error::other(other.to_string()),
     }
 }
 

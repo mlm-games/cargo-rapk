@@ -78,8 +78,8 @@ fn best_ndk_under(sdk: &std::path::Path) -> Option<std::path::PathBuf> {
                 .and_then(|line| line.split_once('='))
                 .map(|(_, v)| v.trim());
 
-            if let Some(v) = revision_line {
-                if let Some(rev) = parse_pkg_revision(v) {
+            if let Some(v) = revision_line
+                && let Some(rev) = parse_pkg_revision(v) {
                     let pick = match &best {
                         None => true,
                         Some((_, old)) => rev > *old,
@@ -88,7 +88,6 @@ fn best_ndk_under(sdk: &std::path::Path) -> Option<std::path::PathBuf> {
                         best = Some((cand.clone(), rev));
                     }
                 }
-            }
         }
     }
     best.map(|(p, _)| p)
@@ -662,11 +661,10 @@ impl Ndk {
                 let jar = parent
                     .parent()
                     .map(|p| p.join("lib").join("kotlin-stdlib.jar"));
-                if let Some(jar) = jar {
-                    if jar.exists() {
+                if let Some(jar) = jar
+                    && jar.exists() {
                         return Ok(jar);
                     }
-                }
             }
         }
         Err(NdkError::CmdNotFound(
