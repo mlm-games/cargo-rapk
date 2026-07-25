@@ -10,5 +10,7 @@ jobs:
     uses: mlm-games/ci/.github/workflows/crate-publish.yml@main
     with:
       create-release: true
+      workspace-publish: true
+      workspace-exclude: "rndk ndk-examples"
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
