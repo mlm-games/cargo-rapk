@@ -197,6 +197,7 @@ impl<'a> ApkBuilder<'a> {
                 cargo.arg("--target").arg(target.rust_triple());
             }
             self.cmd.args().apply(&mut cargo);
+            apply_manifest_features(&self.manifest, &mut cargo);
             if !cargo.status()?.success() {
                 return Err(NdkError::CmdFailed(Box::new(cargo)).into());
             }
@@ -391,6 +392,7 @@ impl<'a> ApkBuilder<'a> {
                 cargo.arg("--target").arg(triple);
             }
             self.cmd.args().apply(&mut cargo);
+            apply_manifest_features(&self.manifest, &mut cargo);
             if !cargo.status()?.success() {
                 return Err(NdkError::CmdFailed(Box::new(cargo)).into());
             }
@@ -520,6 +522,7 @@ impl<'a> ApkBuilder<'a> {
             )?;
             cargo.arg(cargo_cmd);
             self.cmd.args().apply(&mut cargo);
+            apply_manifest_features(&self.manifest, &mut cargo);
 
             if self.cmd.target().is_none() || self.universal {
                 let triple = target.rust_triple();
@@ -549,6 +552,13 @@ impl<'a> ApkBuilder<'a> {
             .min_sdk_version
             .unwrap_or(23)
             .max(23)
+    }
+}
+
+fn apply_manifest_features(manifest: &Manifest, cargo: &mut std::process::Command) {
+    if !manifest.features.is_empty() {
+        cargo.arg("--features");
+        cargo.arg(manifest.features.join(","));
     }
 }
 

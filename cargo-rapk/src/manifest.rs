@@ -28,6 +28,7 @@ pub(crate) struct Manifest {
     pub(crate) signing: HashMap<String, Signing>,
     pub(crate) reverse_port_forward: HashMap<String, String>,
     pub(crate) strip: StripConfig,
+    pub(crate) features: Vec<String>,
 }
 
 impl Manifest {
@@ -55,6 +56,7 @@ impl Manifest {
             signing: metadata.signing,
             reverse_port_forward: metadata.reverse_port_forward,
             strip: metadata.strip,
+            features: metadata.features,
         })
     }
 }
@@ -116,6 +118,9 @@ struct AndroidMetadata {
     reverse_port_forward: HashMap<String, String>,
     #[serde(default)]
     strip: StripConfig,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_one_or_many")]
+    features: Vec<String>,
 }
 
 pub(crate) fn deserialize_one_or_many<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
