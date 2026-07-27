@@ -33,6 +33,10 @@ struct Args {
     #[clap(long, default_value = "apk", value_parser = ["apk", "aab"])]
     format: String,
 
+    /// Build for all four Android ABIs (arm64-v8a, armeabi-v7a, x86_64, x86) in a single artifact
+    #[clap(long)]
+    universal: bool,
+
     // Reproducibility knobs
     /// Enable deterministic (reproducible) build settings
     #[clap(long, env = "CARGO_RAPK_DETERMINISTIC")]
@@ -174,6 +178,9 @@ fn main() -> anyhow::Result<()> {
                 _ => BuildFormat::Apk,
             };
             $builder.set_format(fmt);
+            if $args.universal {
+                $builder.set_universal();
+            }
             $builder.set_repro_flags(
                 $args.deterministic,
                 $args.unsigned,

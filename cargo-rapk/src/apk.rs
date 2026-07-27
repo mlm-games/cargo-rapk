@@ -36,6 +36,13 @@ impl Default for ReproCfg {
     }
 }
 
+const UNIVERSAL_TARGETS: &[Target] = &[
+    Target::Arm64V8a,
+    Target::ArmV7a,
+    Target::X86,
+    Target::X86_64,
+];
+
 pub struct ApkBuilder<'a> {
     cmd: &'a Subcommand,
     ndk: Ndk,
@@ -45,6 +52,7 @@ pub struct ApkBuilder<'a> {
     device_serial: Option<String>,
     repro: ReproCfg,
     format: BuildFormat,
+    universal: bool,
 }
 
 impl<'a> ApkBuilder<'a> {
@@ -132,11 +140,21 @@ impl<'a> ApkBuilder<'a> {
             device_serial,
             repro: ReproCfg::default(),
             format: BuildFormat::Apk,
+            universal: false,
         })
     }
 
     pub fn set_format(&mut self, format: BuildFormat) {
         self.format = format;
+    }
+
+    /// Build for all four Android ABIs in a single artifact.
+    /// Overrides any target set via `--target` or manifest `build-targets`.
+    /// When set, each ABI gets its own `--target` in the cargo invocation
+    /// regardless of any `--target` passed on the CLI.
+    pub fn set_universal(&mut self) {
+        self.build_targets = UNIVERSAL_TARGETS.to_vec();
+        self.universal = true;
     }
 
     pub fn set_repro_flags(
@@ -175,7 +193,7 @@ impl<'a> ApkBuilder<'a> {
                 },
             )?;
             cargo.arg("check");
-            if self.cmd.target().is_none() {
+            if self.cmd.target().is_none() || self.universal {
                 cargo.arg("--target").arg(target.rust_triple());
             }
             self.cmd.args().apply(&mut cargo);
@@ -369,7 +387,7 @@ impl<'a> ApkBuilder<'a> {
                 },
             )?;
             cargo.arg("build");
-            if self.cmd.target().is_none() {
+            if self.cmd.target().is_none() || self.universal {
                 cargo.arg("--target").arg(triple);
             }
             self.cmd.args().apply(&mut cargo);
@@ -503,7 +521,7 @@ impl<'a> ApkBuilder<'a> {
             cargo.arg(cargo_cmd);
             self.cmd.args().apply(&mut cargo);
 
-            if self.cmd.target().is_none() {
+            if self.cmd.target().is_none() || self.universal {
                 let triple = target.rust_triple();
                 cargo.arg("--target").arg(triple);
             }
