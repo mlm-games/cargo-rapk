@@ -117,6 +117,15 @@ pub fn cargo_ndk(
             rustflags.push_str("=/cargo-home");
             rustflags.push_str(SEP);
         }
+        if let Some(rustup_home) = std::env::var("RUSTUP_HOME")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.rustup")))
+        {
+            rustflags.push_str("--remap-path-prefix=");
+            rustflags.push_str(&rustup_home);
+            rustflags.push_str("=/rustup-home");
+            rustflags.push_str(SEP);
+        }
         rustflags.push_str("-Cdebuginfo=0");
         rustflags.push_str(SEP);
         rustflags.push_str("-Clink-arg=-Wl,--build-id=none");
