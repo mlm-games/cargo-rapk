@@ -290,7 +290,7 @@ impl Ndk {
             .filter_map(|path| path.file_name().into_string().ok())
             .filter_map(|name| {
                 name.strip_prefix("android-")
-                    .and_then(|api| api.parse::<u32>().ok())
+                    .and_then(|api| api.split('.').next()?.parse::<u32>().ok())
             })
             .filter(|level| *level >= min_platform_level)
             .collect();
@@ -384,14 +384,16 @@ impl Ndk {
     }
 
     pub fn platform_dir(&self, platform: u32) -> Result<PathBuf, NdkError> {
-        let dir = self
-            .sdk_path
-            .join("platforms")
-            .join(format!("android-{platform}"));
-        if !dir.exists() {
-            return Err(NdkError::PlatformNotFound(platform));
+        for suffix in [
+            format!("android-{platform}"),
+            format!("android-{platform}.0"),
+        ] {
+            let dir = self.sdk_path.join("platforms").join(&suffix);
+            if dir.exists() {
+                return Ok(dir);
+            }
         }
-        Ok(dir)
+        Err(NdkError::PlatformNotFound(platform))
     }
 
     pub fn android_jar(&self, platform: u32) -> Result<PathBuf, NdkError> {
