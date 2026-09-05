@@ -401,11 +401,10 @@ impl MavenToolchain {
             return Ok(p);
         }
         if let Ok(home) = std::env::var("JAVA_HOME") {
-            let c = PathBuf::from(home).join("bin").join("java");
             #[cfg(target_os = "windows")]
-            {
-                c.set_extension("exe");
-            }
+            let c = PathBuf::from(home).join("bin").join("java.exe");
+            #[cfg(not(target_os = "windows"))]
+            let c = PathBuf::from(home).join("bin").join("java");
             if c.is_file() {
                 return Ok(c);
             }
@@ -752,10 +751,6 @@ fn file_digest_hex(path: &Path, tool: &str, shasum_bits: &str, hex_len: usize) -
 
 fn file_sha256_hex(path: &Path) -> Option<String> {
     file_digest_hex(path, "sha256sum", "256", 64)
-}
-
-fn file_sha1_hex(path: &Path) -> Option<String> {
-    file_digest_hex(path, "sha1sum", "1", 40)
 }
 
 fn expected_sha256(version: &str, zip_path: &Path) -> Option<String> {
