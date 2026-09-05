@@ -10,7 +10,7 @@
 //! reuses that name for its Java main class.
 //!
 //! Missing compiler is fetched into the cache, Maven Central first (same
-//! artifacts the Gradle plugin resolves), dist zip as fallback if no java.
+//! artifacts the Gradle plugin resolves), dist zip as fallback (only for exceptional cases).
 //! `CARGO_RAPK_KOTLIN_VERSION` (default `2.2.10`), `CARGO_RAPK_KOTLIN_SHA256`,
 //! `CARGO_RAPK_FETCH_KOTLIN=never|force`, `CARGO_RAPK_NO_FETCH_KOTLIN=1`.
 
