@@ -549,15 +549,49 @@ fn fetch_artifact(
     artifact: &str,
     version: &str,
     ext: &str,
-) -> Result<PathBuf, String> {
+) -> Result<Option<PathBuf>, String> {
+    fetch_artifact_inner(dir, group, artifact, version, ext, false)
+}
+
+fn url_definitely_missing(url: &str) -> Option<bool> {
+    if which::which("curl").is_err() {
+        return None;
+    }
+    match Command::new("curl")
+        .arg("-fsSI")
+        .arg("-o")
+        .arg("/dev/null")
+        .arg(url)
+        .output()
+    {
+        Ok(out) if out.status.success() => Some(false),
+        Ok(out) if out.status.code() == Some(22) => Some(true),
+        _ => None,
+    }
+}
+
+fn fetch_artifact_inner(
+    dir: &Path,
+    group: &str,
+    artifact: &str,
+    version: &str,
+    ext: &str,
+    allow_unpublished: bool,
+) -> Result<Option<PathBuf>, String> {
+    let jar_url = artifact_url(group, artifact, version, ext);
     let dest = dir.join(format!("{artifact}-{version}.{ext}"));
+    // Stale POMs can reference artifacts never published for this version
+    if allow_unpublished && url_definitely_missing(&jar_url) == Some(true) {
+        log::warn!("skipping unpublished {artifact}-{version}.{ext}");
+        return Ok(None);
+    }
     let sha_url = artifact_url(group, artifact, version, &format!("{ext}.sha1"));
     let want = download_text(&sha_url)
         .ok()
         .and_then(|t| t.split_whitespace().next().map(str::to_string))
         .ok_or_else(|| format!("no usable .sha1 sidecar for {artifact}-{version}.{ext}"))?;
     if dest.is_file() && verify_sha1(&dest, &want) {
-        return Ok(dest);
+        return Ok(Some(dest));
     }
     let _ = std::fs::remove_file(&dest);
     download_with_curl_or_wget(&artifact_url(group, artifact, version, ext), &dest)?;
@@ -565,7 +599,7 @@ fn fetch_artifact(
         let _ = std::fs::remove_file(&dest);
         return Err(format!("sha1 mismatch for {artifact}-{version}.{ext}"));
     }
-    Ok(dest)
+    Ok(Some(dest))
 }
 
 pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
@@ -579,10 +613,13 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
         version: version.clone(),
         reason,
     };
-    let root_pom =
-        fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "pom").map_err(&fail)?;
+    let root_pom = fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "pom")
+        .map_err(&fail)?
+        .ok_or_else(|| fail("embeddable POM unpublished".into()))?;
     let root_xml = std::fs::read_to_string(&root_pom).map_err(|e| fail(e.to_string()))?;
-    fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "jar").map_err(&fail)?;
+    fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "jar")
+        .map_err(&fail)?
+        .ok_or_else(|| fail("embeddable jar unpublished".into()))?;
     let mut seen = std::collections::HashSet::from([(
         KOTLIN_GROUP.to_string(),
         EMBEDDABLE_ARTIFACT.to_string(),
@@ -592,15 +629,25 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
     for dep in parse_pom_deps(&root_xml) {
         let key = (dep.group.clone(), dep.artifact.clone(), dep.version.clone());
         if seen.insert(key) {
-            fetch_artifact(&dir, &dep.group, &dep.artifact, &dep.version, "jar").map_err(&fail)?;
+            fetch_artifact(&dir, &dep.group, &dep.artifact, &dep.version, "jar")
+                .map_err(&fail)?
+                .ok_or_else(|| fail(format!("{} unpublished", dep.artifact)))?;
         }
         if !dep.no_descend {
             depth1.push(dep);
         }
     }
     for dep in depth1 {
-        let pom_path = match fetch_artifact(&dir, &dep.group, &dep.artifact, &dep.version, "pom") {
-            Ok(p) => p,
+        let pom_path = match fetch_artifact_inner(
+            &dir,
+            &dep.group,
+            &dep.artifact,
+            &dep.version,
+            "pom",
+            true,
+        ) {
+            Ok(Some(p)) => p,
+            Ok(None) => continue,
             Err(e) => {
                 log::warn!("skipping transitive POM for {}: {e}", dep.artifact);
                 continue;
@@ -609,8 +656,16 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
         let xml = std::fs::read_to_string(&pom_path).map_err(|e| fail(e.to_string()))?;
         for t in parse_pom_deps(&xml) {
             let key = (t.group.clone(), t.artifact.clone(), t.version.clone());
-            if seen.insert(key) {
-                fetch_artifact(&dir, &t.group, &t.artifact, &t.version, "jar").map_err(&fail)?;
+            if seen.insert(key)
+                && fetch_artifact_inner(&dir, &t.group, &t.artifact, &t.version, "jar", true)
+                    .map_err(&fail)?
+                    .is_none()
+            {
+                log::warn!(
+                    "transitive {}-{} not published; compiler runs without it",
+                    t.artifact,
+                    t.version
+                );
             }
         }
     }

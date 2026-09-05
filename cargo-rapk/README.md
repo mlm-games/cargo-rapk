@@ -94,10 +94,12 @@ name = "rust.rlobkit.RlobKitPickerActivity"
 exported = false
 
 # Kotlin (`*.kt` in `java_sources`, e.g. rlobkit-app-events):
-# Pure `.java`/`.jar` never calls `kotlinc`. With `.kt`, missing `kotlinc`
-# is fetched into `$XDG_CACHE_HOME/cargo-rapk/kotlin` and `.sha256` checked.
-# Lookup: `CARGO_RAPK_KOTLINC`/`KOTLINC`, `KOTLIN_HOME`, PATH, then cache.
-# Pins: `CARGO_RAPK_KOTLIN_VERSION` (default `2.2.10`), `CARGO_RAPK_KOTLIN_SHA256`,
+# Pure `.java`/`.jar` never calls `kotlinc`. With `.kt`, a missing compiler
+# is fetched from Maven Central (same `kotlin-compiler-embeddable` the Gradle
+# plugin resolves; jars `.sha1`-verified, run as `java -cp … K2JVMCompiler`),
+# dist zip as fallback. Lookup: explicit path, Maven cache, PATH (version
+# checked against pin), dist cache. Pins: `CARGO_RAPK_KOTLIN_VERSION`
+# (default `2.2.10`), `CARGO_RAPK_KOTLIN_SHA256`,
 # `CARGO_RAPK_FETCH_KOTLIN=never|force`, `CARGO_RAPK_NO_FETCH_KOTLIN=1`.
 
 # Path to the folder containing your application's assets.
