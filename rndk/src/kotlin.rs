@@ -29,11 +29,7 @@ const ENV_LEGACY_COMPILER: &str = "KOTLIN_COMPILER";
 pub fn kotlin_version() -> String {
     for key in ["CARGO_RAPK_KOTLIN_VERSION", "KOTLIN_VERSION"] {
         if let Ok(v) = std::env::var(key) {
-            let v = v
-                .trim()
-                .trim_matches('"')
-                .trim_start_matches('v')
-                .to_string();
+            let v = normalize_pin(&v);
             if !v.is_empty() {
                 return v;
             }
@@ -98,6 +94,81 @@ fn kotlinc_in_dir(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+fn parse_triple(s: &str) -> Option<(u32, u32, u32)> {
+    let mut nums = s
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty());
+    Some((nums.next()?.parse().ok()?, nums.next()?.parse().ok()?, {
+        let patch: String = nums
+            .next()?
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        patch.parse().ok()?
+    }))
+}
+
+/// First `x.y.z` in `s` (e.g. `kotlinc-jvm 2.4.10 (JRE ...)`).
+fn first_triple(s: &str) -> Option<String> {
+    for tok in s.split_whitespace() {
+        let t = tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if t.chars().filter(|c| *c == '.').count() >= 2 && parse_triple(t).is_some() {
+            return parse_triple(t).map(|(a, b, c)| format!("{a}.{b}.{c}"));
+        }
+    }
+    None
+}
+
+fn normalize_pin(pin: &str) -> String {
+    pin.trim()
+        .trim_matches('"')
+        .trim_start_matches('v')
+        .to_string()
+}
+
+/// Version reported by a kotlinc binary, if runnable.
+pub fn probed_kotlinc_version(bin: &Path) -> Option<String> {
+    let out = Command::new(bin).arg("-version").output().ok()?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    first_triple(&combined)
+}
+
+fn pin_matches_bin(pin: &str, bin: &Path) -> bool {
+    match probed_kotlinc_version(bin) {
+        Some(v) if v == normalize_pin(pin) => true,
+        Some(v) => {
+            log::warn!(
+                "ignoring kotlinc {} (version {v}, want {pin})",
+                bin.display()
+            );
+            false
+        }
+        None => {
+            log::warn!("could not probe {} version; ignoring", bin.display());
+            false
+        }
+    }
+}
+
+/// Marker written next to a fetched compiler so cache hits need no JVM probe.
+fn cache_marker() -> PathBuf {
+    kotlin_cache_dir()
+        .join("kotlinc")
+        .join(".cargo-rapk-version")
+}
+
+fn cache_matches_pin(pin: &str) -> bool {
+    match std::fs::read_to_string(cache_marker()) {
+        Ok(v) if v.trim() == normalize_pin(pin) => true,
+        Ok(_) => false,
+        Err(_) => pin_matches_bin(pin, &expected_kotlinc_path()),
+    }
+}
+
 fn stdlib_next_to_kotlinc(kotlinc: &Path) -> Option<PathBuf> {
     let resolved = std::fs::canonicalize(kotlinc).unwrap_or_else(|_| kotlinc.to_path_buf());
     let bin_dir = resolved.parent()?;
@@ -127,7 +198,9 @@ pub fn resolve_kotlinc_path() -> Option<PathBuf> {
         }
     }
     if let Ok(p) = which::which("kotlinc") {
-        return Some(p);
+        if pin_matches_bin(&kotlin_version(), &p) {
+            return Some(p);
+        }
     }
     if let Ok(v) = std::env::var(ENV_LEGACY_COMPILER) {
         let p = PathBuf::from(v.trim());
@@ -139,7 +212,7 @@ pub fn resolve_kotlinc_path() -> Option<PathBuf> {
         }
     }
     let cached = expected_kotlinc_path();
-    if is_executable_file(&cached) {
+    if is_executable_file(&cached) && cache_matches_pin(&kotlin_version()) {
         return Some(cached);
     }
     None
@@ -449,6 +522,7 @@ fn fetch_kotlin_into_cache(version: &str) -> Result<(), NdkError> {
             reason: "unzip succeeded but kotlinc/bin/kotlinc missing".into(),
         });
     }
+    let _ = std::fs::write(cache_marker(), normalize_pin(version));
     Ok(())
 }
 

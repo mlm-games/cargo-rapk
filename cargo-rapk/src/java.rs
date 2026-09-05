@@ -152,6 +152,8 @@ pub(crate) fn compile_java_sources(
         javac
             .arg("-encoding")
             .arg("UTF-8")
+            .arg("--release")
+            .arg("8")
             .arg("-classpath")
             .arg(&classpath)
             .arg("-d")
@@ -167,6 +169,9 @@ pub(crate) fn compile_java_sources(
     if !kt_files.is_empty() {
         let mut kotlinc = ndk.kotlinc()?;
         kotlinc
+            // Pinned so output doesn't follow kotlinc's default (already 1.8, made explicit).
+            .arg("-jvm-target")
+            .arg("1.8")
             .arg("-classpath")
             .arg(&classpath)
             .arg("-d")
