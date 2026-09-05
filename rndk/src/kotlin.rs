@@ -198,9 +198,10 @@ pub fn resolve_kotlinc_path() -> Option<PathBuf> {
         }
     }
     if let Ok(p) = which::which("kotlinc")
-        && pin_matches_bin(&kotlin_version(), &p) {
-            return Some(p);
-        }
+        && pin_matches_bin(&kotlin_version(), &p)
+    {
+        return Some(p);
+    }
     if let Ok(v) = std::env::var(ENV_LEGACY_COMPILER) {
         let p = PathBuf::from(v.trim());
         if is_executable_file(&p) {
