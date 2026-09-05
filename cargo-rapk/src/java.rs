@@ -168,12 +168,22 @@ pub(crate) fn compile_java_sources(
 
     if !kt_files.is_empty() {
         let mut kotlinc = ndk.kotlinc()?;
+        // -no-stdlib + explicit stdlib first has identical output to the dist
+        // script's auto-added stdlib, but works for both the launcher script
+        // and the `java -cp … K2JVMCompiler` Maven mode.
+        let mut kc_classpath = kotlin_stdlib_jar
+            .as_ref()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        kc_classpath.push(path_separator);
+        kc_classpath.push_str(&classpath);
         kotlinc
             // Pinned so output doesn't follow kotlinc's default (already 1.8, made explicit).
             .arg("-jvm-target")
             .arg("1.8")
+            .arg("-no-stdlib")
             .arg("-classpath")
-            .arg(&classpath)
+            .arg(&kc_classpath)
             .arg("-d")
             .arg(&classes_dir);
         for kt_file in &kt_files {

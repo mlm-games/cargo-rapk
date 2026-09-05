@@ -610,19 +610,18 @@ impl Ndk {
 
     /// kotlinc, fetching into cache if `.kt` needs it. Pure `.java` never calls this.
     pub fn kotlinc(&self) -> Result<Command, NdkError> {
-        let path = crate::kotlin::ensure_kotlinc()?;
-        Ok(crate::kotlin::kotlinc_command(&path))
+        crate::kotlin::ensure_kotlin_toolchain()?.command()
     }
 
     /// kotlinc without network.
     pub fn kotlinc_no_fetch(&self) -> Result<Command, NdkError> {
-        let path = crate::kotlin::resolve_kotlinc_path()
-            .ok_or_else(|| NdkError::CmdNotFound(crate::kotlin::kotlin_version()))?;
-        Ok(crate::kotlin::kotlinc_command(&path))
+        crate::kotlin::resolve_toolchain()
+            .ok_or_else(|| NdkError::CmdNotFound(crate::kotlin::kotlin_version()))?
+            .command()
     }
 
     pub fn kotlin_stdlib_jar(&self) -> Result<PathBuf, NdkError> {
-        crate::kotlin::ensure_stdlib()
+        Ok(crate::kotlin::ensure_kotlin_toolchain()?.stdlib_jar())
     }
 
     pub fn debug_key(&self) -> Result<Key, NdkError> {

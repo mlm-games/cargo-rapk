@@ -9,8 +9,9 @@
 //! `KOTLIN_COMPILER` is never passed to the child: the kotlinc launcher
 //! reuses that name for its Java main class.
 //!
-//! Missing compiler is fetched into the cache. `CARGO_RAPK_KOTLIN_VERSION`
-//! (default `2.2.10`), `CARGO_RAPK_KOTLIN_SHA256`,
+//! Missing compiler is fetched into the cache, Maven Central first (same
+//! artifacts the Gradle plugin resolves), dist zip as fallback if no java.
+//! `CARGO_RAPK_KOTLIN_VERSION` (default `2.2.10`), `CARGO_RAPK_KOTLIN_SHA256`,
 //! `CARGO_RAPK_FETCH_KOTLIN=never|force`, `CARGO_RAPK_NO_FETCH_KOTLIN=1`.
 
 use std::path::{Path, PathBuf};
@@ -263,12 +264,11 @@ fn fetch_forced() -> bool {
 fn install_instructions(version: &str) -> String {
     let cache = expected_kotlinc_path();
     format!(
-        "kotlinc not found (java_sources contain *.kt). Install kotlinc {version}+, \
-put it on PATH, or set CARGO_RAPK_KOTLINC / KOTLIN_HOME. Expected: {}. Manual: \
-curl -fsSL -o /tmp/kotlin.zip https://github.com/JetBrains/kotlin/releases/download/v{version}/kotlin-compiler-{version}.zip \
-&& unzip -q /tmp/kotlin.zip -d {}",
+        "kotlinc not found (java_sources contain *.kt). Auto-fetch from Maven Central \
+needs curl/wget + java, or install kotlinc {version}+, put it on PATH, \
+or set CARGO_RAPK_KOTLINC / KOTLIN_HOME. Expected dist cache: {}. Maven cache: {}",
         cache.display(),
-        kotlin_cache_dir().display(),
+        maven_dir(version).display(),
     )
 }
 
@@ -317,6 +317,376 @@ pub fn kotlinc_command(path: &Path) -> Command {
     cmd
 }
 
+// It is the same compiler that Gradle plugin resolves (`kotlin-compiler-embeddable`),
+
+const MAVEN_BASE: &str = "https://repo.maven.apache.org/maven2";
+const KOTLIN_CLI_MAIN: &str = "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler";
+const EMBEDDABLE_ARTIFACT: &str = "kotlin-compiler-embeddable";
+const KOTLIN_GROUP: &str = "org.jetbrains.kotlin";
+
+fn maven_dir(version: &str) -> PathBuf {
+    kotlin_cache_dir()
+        .join("maven")
+        .join(normalize_pin(version))
+}
+
+fn maven_marker(version: &str) -> PathBuf {
+    maven_dir(version).join(".cargo-rapk-version")
+}
+
+fn artifact_url(group: &str, artifact: &str, version: &str, ext: &str) -> String {
+    format!(
+        "{MAVEN_BASE}/{}/{artifact}/{version}/{artifact}-{version}.{ext}",
+        group.replace('.', "/")
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct MavenToolchain {
+    pub dir: PathBuf,
+    pub jars: Vec<PathBuf>,
+    pub stdlib: PathBuf,
+}
+
+fn sorted_jars(dir: &Path) -> Option<Vec<PathBuf>> {
+    let mut jars = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        if !name.ends_with(".jar") || name.contains("sources") || name.contains("javadoc") {
+            continue;
+        }
+        jars.push(path);
+    }
+    jars.sort();
+    if jars.is_empty() { None } else { Some(jars) }
+}
+
+fn find_stdlib(jars: &[PathBuf]) -> Option<PathBuf> {
+    jars.iter()
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("kotlin-stdlib-"))
+        })
+        .cloned()
+}
+
+fn maven_has_compiler(jars: &[PathBuf]) -> bool {
+    jars.iter().any(|p| {
+        p.file_name().is_some_and(|n| {
+            n.to_string_lossy()
+                .starts_with(&format!("{EMBEDDABLE_ARTIFACT}-"))
+        })
+    })
+}
+
+/// Resolve a previously fetched Maven toolchain (no network).
+pub fn resolve_maven() -> Option<MavenToolchain> {
+    let version = kotlin_version();
+    if std::fs::read_to_string(maven_marker(&version)).ok()?.trim() != normalize_pin(&version) {
+        return None;
+    }
+    let dir = maven_dir(&version);
+    let jars = sorted_jars(&dir)?;
+    if !maven_has_compiler(&jars) {
+        return None;
+    }
+    let stdlib = find_stdlib(&jars)?;
+    Some(MavenToolchain { dir, jars, stdlib })
+}
+
+impl MavenToolchain {
+    fn java_bin() -> Result<PathBuf, String> {
+        if let Ok(p) = which::which("java") {
+            return Ok(p);
+        }
+        if let Ok(home) = std::env::var("JAVA_HOME") {
+            let c = PathBuf::from(home).join("bin").join("java");
+            #[cfg(target_os = "windows")]
+            {
+                c.set_extension("exe");
+            }
+            if c.is_file() {
+                return Ok(c);
+            }
+        }
+        Err(
+            "`java` not found on PATH (or JAVA_HOME); a JRE is required to run the Kotlin compiler"
+                .into(),
+        )
+    }
+
+    /// `java -cp <closure> K2JVMCompiler`.
+    pub fn command(&self) -> Result<Command, NdkError> {
+        let java = Self::java_bin().map_err(NdkError::KotlinJavaMissing)?;
+        let sep = if cfg!(target_os = "windows") {
+            ";"
+        } else {
+            ":"
+        };
+        let cp = self
+            .jars
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(sep);
+        let mut cmd = Command::new(java);
+        cmd.arg("-cp").arg(cp).arg(KOTLIN_CLI_MAIN);
+        cmd.env_remove(ENV_LEGACY_COMPILER);
+        Ok(cmd)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MavenDep {
+    group: String,
+    artifact: String,
+    version: String,
+    no_descend: bool,
+}
+
+fn extract_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let body_start = match rest[start..].find('>') {
+            Some(i) => start + i + 1,
+            None => break,
+        };
+        let Some(end) = rest[body_start..].find(&close) else {
+            break;
+        };
+        out.push(&rest[body_start..body_start + end]);
+        rest = &rest[body_start + end + close.len()..];
+    }
+    out
+}
+
+fn extract_one(block: &str, tag: &str) -> Option<String> {
+    extract_blocks(block, tag)
+        .first()
+        .map(|s| s.trim().to_string())
+}
+
+/// Parse `<dependencies>` from a POM: direct deps with `${prop}` substituted.
+/// `no_descend` marks wildcard-excluded deps (their own POMs aren't followed).
+fn parse_pom_deps(pom_xml: &str) -> Vec<MavenDep> {
+    let mut props = std::collections::HashMap::new();
+    for block in extract_blocks(pom_xml, "properties") {
+        // `<properties><a>1</a><b>2</b></properties>`: split on '<'.
+        // The last value has no trailing '<', so default to the whole rest.
+        for chunk in block.split('<').skip(1) {
+            if let Some((name, rest)) = chunk.split_once('>') {
+                let value = rest.split_once('<').map(|(v, _)| v).unwrap_or(rest);
+                if !name.starts_with('/') && !value.trim().is_empty() {
+                    props.insert(name.to_string(), value.trim().to_string());
+                }
+            }
+        }
+    }
+    let subst = |v: &str| {
+        let mut v = v.trim().to_string();
+        for (k, val) in &props {
+            v = v.replace(&format!("${{{k}}}"), val);
+        }
+        v
+    };
+    let mut deps = Vec::new();
+    for dep_block in extract_blocks(pom_xml, "dependencies")
+        .iter()
+        .flat_map(|b| extract_blocks(b, "dependency"))
+    {
+        let scope = extract_one(dep_block, "scope")
+            .unwrap_or_else(|| "compile".to_string())
+            .to_ascii_lowercase();
+        if matches!(scope.as_str(), "test" | "provided" | "system") {
+            continue;
+        }
+        if extract_one(dep_block, "optional").is_some_and(|o| o == "true") {
+            continue;
+        }
+        let (Some(group), Some(artifact), Some(version)) = (
+            extract_one(dep_block, "groupId"),
+            extract_one(dep_block, "artifactId"),
+            extract_one(dep_block, "version").map(|v| subst(&v)),
+        ) else {
+            continue;
+        };
+        let no_descend = extract_blocks(dep_block, "exclusions").iter().any(|ex| {
+            extract_blocks(ex, "exclusion").iter().any(|e| {
+                extract_one(e, "artifactId").is_some_and(|a| a == "*")
+                    || extract_one(e, "groupId").is_some_and(|g| g == "*")
+            })
+        });
+        deps.push(MavenDep {
+            group,
+            artifact,
+            version,
+            no_descend,
+        });
+    }
+    deps
+}
+
+fn download_text(url: &str) -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!("cargo-rapk-pom-{}", std::process::id()));
+    download_with_curl_or_wget(url, &tmp)?;
+    let text = std::fs::read_to_string(&tmp).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(text)
+}
+
+fn verify_sha1(path: &Path, expected: &str) -> bool {
+    let actual = file_digest_hex(path, "sha1sum", "1", 40);
+    actual.is_some_and(|a| a == expected.trim().to_ascii_lowercase())
+}
+
+/// Download one Maven artifact + fail-closed `.sha1` check. Reuses verified files.
+fn fetch_artifact(
+    dir: &Path,
+    group: &str,
+    artifact: &str,
+    version: &str,
+    ext: &str,
+) -> Result<PathBuf, String> {
+    let dest = dir.join(format!("{artifact}-{version}.{ext}"));
+    let sha_url = artifact_url(group, artifact, version, &format!("{ext}.sha1"));
+    let want = download_text(&sha_url)
+        .ok()
+        .and_then(|t| t.split_whitespace().next().map(str::to_string))
+        .ok_or_else(|| format!("no usable .sha1 sidecar for {artifact}-{version}.{ext}"))?;
+    if dest.is_file() && verify_sha1(&dest, &want) {
+        return Ok(dest);
+    }
+    let _ = std::fs::remove_file(&dest);
+    download_with_curl_or_wget(&artifact_url(group, artifact, version, ext), &dest)?;
+    if !verify_sha1(&dest, &want) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!("sha1 mismatch for {artifact}-{version}.{ext}"));
+    }
+    Ok(dest)
+}
+
+pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
+    let version = normalize_pin(version);
+    let dir = maven_dir(&version);
+    std::fs::create_dir_all(&dir).map_err(|e| NdkError::KotlinFetchFailed {
+        version: version.clone(),
+        reason: e.to_string(),
+    })?;
+    let fail = |reason: String| NdkError::KotlinFetchFailed {
+        version: version.clone(),
+        reason,
+    };
+    let root_pom =
+        fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "pom").map_err(&fail)?;
+    let root_xml = std::fs::read_to_string(&root_pom).map_err(|e| fail(e.to_string()))?;
+    fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "jar").map_err(&fail)?;
+    let mut seen = std::collections::HashSet::from([(
+        KOTLIN_GROUP.to_string(),
+        EMBEDDABLE_ARTIFACT.to_string(),
+        version.clone(),
+    )]);
+    let mut depth1 = Vec::new();
+    for dep in parse_pom_deps(&root_xml) {
+        let key = (dep.group.clone(), dep.artifact.clone(), dep.version.clone());
+        if seen.insert(key) {
+            fetch_artifact(&dir, &dep.group, &dep.artifact, &dep.version, "jar").map_err(&fail)?;
+        }
+        if !dep.no_descend {
+            depth1.push(dep);
+        }
+    }
+    for dep in depth1 {
+        let pom_path = match fetch_artifact(&dir, &dep.group, &dep.artifact, &dep.version, "pom") {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("skipping transitive POM for {}: {e}", dep.artifact);
+                continue;
+            }
+        };
+        let xml = std::fs::read_to_string(&pom_path).map_err(|e| fail(e.to_string()))?;
+        for t in parse_pom_deps(&xml) {
+            let key = (t.group.clone(), t.artifact.clone(), t.version.clone());
+            if seen.insert(key) {
+                fetch_artifact(&dir, &t.group, &t.artifact, &t.version, "jar").map_err(&fail)?;
+            }
+        }
+    }
+    let _ = std::fs::write(maven_marker(&version), &version);
+    resolve_maven().ok_or_else(|| {
+        fail("fetch succeeded but toolchain incomplete (embeddable or stdlib jar missing)".into())
+    })
+}
+
+/// Which Kotlin toolchain to use, and where it came from.
+pub enum KotlinToolchain {
+    /// Classic `kotlinc` launcher script (explicit install, PATH, or dist cache).
+    Script(PathBuf),
+    /// Maven-Central closure run as `java -cp … K2JVMCompiler`.
+    Maven(MavenToolchain),
+}
+
+impl KotlinToolchain {
+    pub fn command(&self) -> Result<Command, NdkError> {
+        match self {
+            KotlinToolchain::Script(p) => Ok(kotlinc_command(p)),
+            KotlinToolchain::Maven(m) => m.command(),
+        }
+    }
+
+    pub fn stdlib_jar(&self) -> PathBuf {
+        match self {
+            KotlinToolchain::Script(_) => expected_stdlib_path(),
+            KotlinToolchain::Maven(m) => m.stdlib.clone(),
+        }
+    }
+}
+
+/// Resolve the toolchain: explicit script, Maven cache, PATH script
+/// (version-checked), dist cache (version-checked). No network.
+pub fn resolve_toolchain() -> Option<KotlinToolchain> {
+    if !fetch_forced() {
+        if let Some(p) = resolve_kotlinc_path() {
+            return Some(KotlinToolchain::Script(p));
+        }
+        if let Some(m) = resolve_maven() {
+            return Some(KotlinToolchain::Maven(m));
+        }
+    }
+    None
+}
+
+/// Ensure a toolchain: resolve, else fetch Maven Central first (accepted
+/// channel), dist zip as fallback. Only call when `.kt` files are present.
+pub fn ensure_kotlin_toolchain() -> Result<KotlinToolchain, NdkError> {
+    if let Some(t) = resolve_toolchain() {
+        return Ok(t);
+    }
+    let version = kotlin_version();
+    if fetch_disabled() {
+        return Err(NdkError::CmdNotFound(install_instructions(&version)));
+    }
+    log::info!("fetching Kotlin v{version} from Maven Central into cache");
+    match fetch_maven(&version) {
+        Ok(m) => return Ok(KotlinToolchain::Maven(m)),
+        Err(e) => log::warn!("maven fetch failed ({e}); falling back to dist zip"),
+    }
+    log::info!("fetching Kotlin v{version} dist zip into cache");
+    match fetch_kotlin_into_cache(&version) {
+        Ok(()) => {}
+        Err(e) => {
+            return Err(NdkError::CmdNotFound(format!(
+                "{e}. {}",
+                install_instructions(&version)
+            )));
+        }
+    }
+    resolve_toolchain().ok_or_else(|| NdkError::CmdNotFound(install_instructions(&version)))
+}
+
 fn kotlin_zip_url(version: &str) -> String {
     format!(
         "https://github.com/JetBrains/kotlin/releases/download/v{version}/kotlin-compiler-{version}.zip"
@@ -358,10 +728,10 @@ fn download_with_curl_or_wget(url: &str, dest: &Path) -> Result<(), String> {
     )
 }
 
-fn file_sha256_hex(path: &Path) -> Option<String> {
+fn file_digest_hex(path: &Path, tool: &str, shasum_bits: &str, hex_len: usize) -> Option<String> {
     for attempt in [
-        vec!["sha256sum", &*path.to_string_lossy()],
-        vec!["shasum", "-a", "256", &*path.to_string_lossy()],
+        vec![tool, &*path.to_string_lossy()],
+        vec!["shasum", "-a", shasum_bits, &*path.to_string_lossy()],
     ] {
         let (bin, args) = (attempt[0], &attempt[1..]);
         if which::which(bin).is_err() {
@@ -373,11 +743,19 @@ fn file_sha256_hex(path: &Path) -> Option<String> {
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         let hex = stdout.split_whitespace().next().unwrap_or("").to_string();
-        if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        if hex.len() == hex_len && hex.chars().all(|c| c.is_ascii_hexdigit()) {
             return Some(hex.to_ascii_lowercase());
         }
     }
     None
+}
+
+fn file_sha256_hex(path: &Path) -> Option<String> {
+    file_digest_hex(path, "sha256sum", "256", 64)
+}
+
+fn file_sha1_hex(path: &Path) -> Option<String> {
+    file_digest_hex(path, "sha1sum", "1", 40)
 }
 
 fn expected_sha256(version: &str, zip_path: &Path) -> Option<String> {
@@ -545,5 +923,72 @@ mod tests {
     fn legacy_class_name_is_not_a_path() {
         let class = PathBuf::from("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler");
         assert!(!class.exists());
+    }
+
+    #[test]
+    fn maven_artifact_urls() {
+        assert_eq!(
+            artifact_url("org.jetbrains.kotlin", "kotlin-stdlib", "2.2.10", "jar"),
+            "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.10/kotlin-stdlib-2.2.10.jar"
+        );
+        assert_eq!(
+            artifact_url(
+                "org.jetbrains.kotlinx",
+                "kotlinx-coroutines-core-jvm",
+                "1.8.0",
+                "pom"
+            ),
+            "https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.8.0/kotlinx-coroutines-core-jvm-1.8.0.pom"
+        );
+    }
+
+    #[test]
+    fn parses_pom_closure() {
+        let pom = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <properties><coroutines.version>1.8.0</coroutines.version></properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.jetbrains.kotlin</groupId>
+      <artifactId>kotlin-stdlib</artifactId>
+      <version>2.2.10</version>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.jetbrains.kotlin</groupId>
+      <artifactId>kotlin-reflect</artifactId>
+      <version>1.6.10</version>
+      <scope>runtime</scope>
+      <exclusions><exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion></exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.jetbrains.kotlinx</groupId>
+      <artifactId>kotlinx-coroutines-core-jvm</artifactId>
+      <version>${coroutines.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>4.13</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let deps = parse_pom_deps(pom);
+        assert_eq!(deps.len(), 3);
+        assert!(
+            deps.iter()
+                .any(|d| d.artifact == "kotlin-stdlib" && !d.no_descend)
+        );
+        let reflect = deps
+            .iter()
+            .find(|d| d.artifact == "kotlin-reflect")
+            .unwrap();
+        assert!(reflect.no_descend);
+        let cor = deps
+            .iter()
+            .find(|d| d.artifact == "kotlinx-coroutines-core-jvm")
+            .unwrap();
+        assert_eq!(cor.version, "1.8.0");
     }
 }

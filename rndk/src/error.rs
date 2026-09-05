@@ -55,6 +55,8 @@ pub enum NdkError {
     KotlinFetchFailed { version: String, reason: String },
     #[error("Kotlin zip SHA256 mismatch: expected {expected}, got {actual}")]
     KotlinChecksumMismatch { expected: String, actual: String },
+    #[error("Java runtime for Kotlin compiler: {0}")]
+    KotlinJavaMissing(String),
     #[error(transparent)]
     Serialize(#[from] SeError),
     #[error("String `{1}` is not a UID")]
