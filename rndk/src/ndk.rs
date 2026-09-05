@@ -608,73 +608,21 @@ impl Ndk {
         Err(NdkError::CmdNotFound(tool.to_string()))
     }
 
-    fn kotlin_cache_dir(&self) -> PathBuf {
-        let home = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join("cargo-rapk").join("kotlin")
+    /// kotlinc, fetching into cache if `.kt` needs it. Pure `.java` never calls this.
+    pub fn kotlinc(&self) -> Result<Command, NdkError> {
+        let path = crate::kotlin::ensure_kotlinc()?;
+        Ok(crate::kotlin::kotlinc_command(&path))
     }
 
-    pub fn kotlinc(&self) -> Result<Command, NdkError> {
-        if let Ok(path) = which::which("kotlinc") {
-            return Ok(Command::new(path));
-        }
-        if let Ok(path_str) = std::env::var("KOTLIN_COMPILER") {
-            let candidate = PathBuf::from(&path_str);
-            if candidate.exists() {
-                return Ok(Command::new(candidate));
-            }
-        }
-        let cache_dir = self.kotlin_cache_dir();
-        let kotlinc_path = cache_dir.join("kotlinc").join("bin").join("kotlinc");
-        #[cfg(target_os = "windows")]
-        let kotlinc_path = kotlinc_path.with_extension("bat");
-        if kotlinc_path.exists() {
-            return Ok(Command::new(kotlinc_path));
-        }
-        Err(NdkError::CmdNotFound(
-            "kotlinc not found. Install Kotlin compiler or set KOTLIN_COMPILER env var".to_string(),
-        ))
+    /// kotlinc without network.
+    pub fn kotlinc_no_fetch(&self) -> Result<Command, NdkError> {
+        let path = crate::kotlin::resolve_kotlinc_path()
+            .ok_or_else(|| NdkError::CmdNotFound(crate::kotlin::kotlin_version()))?;
+        Ok(crate::kotlin::kotlinc_command(&path))
     }
 
     pub fn kotlin_stdlib_jar(&self) -> Result<PathBuf, NdkError> {
-        let cache_jar = self
-            .kotlin_cache_dir()
-            .join("kotlinc")
-            .join("lib")
-            .join("kotlin-stdlib.jar");
-        if cache_jar.exists() {
-            return Ok(cache_jar);
-        }
-        if let Ok(path) = which::which("kotlinc") {
-            let resolved = std::fs::canonicalize(&path).unwrap_or(path);
-            let candidate = resolved
-                .parent()
-                .ok_or_else(|| NdkError::CmdNotFound("kotlinc".to_string()))?
-                .parent()
-                .ok_or_else(|| NdkError::CmdNotFound("kotlinc".to_string()))?
-                .join("lib")
-                .join("kotlin-stdlib.jar");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-        if let Ok(path_str) = std::env::var("KOTLIN_COMPILER") {
-            let candidate = PathBuf::from(&path_str);
-            let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-            if let Some(parent) = resolved.parent() {
-                let jar = parent
-                    .parent()
-                    .map(|p| p.join("lib").join("kotlin-stdlib.jar"));
-                if let Some(jar) = jar
-                    && jar.exists()
-                {
-                    return Ok(jar);
-                }
-            }
-        }
-        Err(NdkError::CmdNotFound(
-            "kotlin-stdlib.jar not found. Install Kotlin compiler or set KOTLIN_COMPILER env var"
-                .to_string(),
-        ))
+        crate::kotlin::ensure_stdlib()
     }
 
     pub fn debug_key(&self) -> Result<Key, NdkError> {

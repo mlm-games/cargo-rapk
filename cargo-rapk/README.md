@@ -78,6 +78,8 @@ resources = "path/to/resources_folder"
 # Path(s) to Java source directories that should be compiled and packaged
 # into the APK (for helper/callback activities and other Java glue code).
 # Accepts either a single path or an array of paths.
+# `.java`/`.jar` need only a JDK (`javac`) + `d8` from the SDK.
+# `*.kt` additionally needs `kotlinc` (see "Kotlin sources" below).
 java_sources = "path/to/java_sources"
 # java_sources = ["path/to/java_sources", "path/to/more_java_sources"]
 
@@ -90,6 +92,13 @@ java_sources = "android"
 [[package.metadata.android.cargo_rapk.activities]]
 name = "rust.rlobkit.RlobKitPickerActivity"
 exported = false
+
+# Kotlin (`*.kt` in `java_sources`, e.g. rlobkit-app-events):
+# Pure `.java`/`.jar` never calls `kotlinc`. With `.kt`, missing `kotlinc`
+# is fetched into `$XDG_CACHE_HOME/cargo-rapk/kotlin` and `.sha256` checked.
+# Lookup: `CARGO_RAPK_KOTLINC`/`KOTLINC`, `KOTLIN_HOME`, PATH, then cache.
+# Pins: `CARGO_RAPK_KOTLIN_VERSION` (default `2.2.10`), `CARGO_RAPK_KOTLIN_SHA256`,
+# `CARGO_RAPK_FETCH_KOTLIN=never|force`, `CARGO_RAPK_NO_FETCH_KOTLIN=1`.
 
 # Path to the folder containing your application's assets.
 # If not specified, assets will not be included in the APK.

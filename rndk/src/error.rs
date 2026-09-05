@@ -51,6 +51,10 @@ pub enum NdkError {
     NonUnicodeEnvVar(&'static str),
     #[error("Command `{}` had a non-zero exit code.", format!("{:?}", .0).replace('"', ""))]
     CmdFailed(Box<Command>),
+    #[error("Failed to fetch Kotlin compiler v{version}: {reason}")]
+    KotlinFetchFailed { version: String, reason: String },
+    #[error("Kotlin zip SHA256 mismatch: expected {expected}, got {actual}")]
+    KotlinChecksumMismatch { expected: String, actual: String },
     #[error(transparent)]
     Serialize(#[from] SeError),
     #[error("String `{1}` is not a UID")]

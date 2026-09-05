@@ -53,6 +53,12 @@ struct Args {
     /// Disable ZIP normalization (escape hatch)
     #[clap(long = "no-normalize-zip")]
     no_normalize_zip: bool,
+    /// Pinned kotlinc version for `*.kt` (default 2.2.10). Pure `.java` never fetches.
+    #[clap(long, env = "CARGO_RAPK_KOTLIN_VERSION")]
+    kotlin_version: Option<String>,
+    /// Kotlin fetch: `auto` (default), `never` (offline, print manual steps), `force`.
+    #[clap(long, env = "CARGO_RAPK_FETCH_KOTLIN")]
+    fetch_kotlin: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -171,6 +177,12 @@ fn main() -> anyhow::Result<()> {
 
     macro_rules! prepare {
         ($args:expr, $cmd:ident, $builder:ident) => {
+            if let Some(ref v) = $args.kotlin_version {
+                unsafe { std::env::set_var("CARGO_RAPK_KOTLIN_VERSION", v) };
+            }
+            if let Some(ref v) = $args.fetch_kotlin {
+                unsafe { std::env::set_var("CARGO_RAPK_FETCH_KOTLIN", v) };
+            }
             let $cmd = Subcommand::new($args.subcommand_args)?;
             let mut $builder = ApkBuilder::from_subcommand(&$cmd, $args.device)?;
             let fmt = match $args.format.as_str() {

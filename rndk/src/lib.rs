@@ -31,6 +31,7 @@ pub use apk::BuildFormat;
 pub mod cargo;
 pub mod dylibs;
 pub mod error;
+pub mod kotlin;
 pub mod manifest;
 pub mod ndk;
 pub mod readelf;
