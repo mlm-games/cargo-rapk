@@ -392,17 +392,16 @@ impl<'a> UnalignedApk<'a> {
         let file = fs::File::create(self.config.aab())?;
         let mut zip = ZipWriter::new(file);
 
-        // BundleConfig.pb:
+        // BundleConfig.pb (android.bundle.BundleConfig proto):
         //   bundletool { version: "1.15.0" }
-        //   type: "REGULAR"
-        //   compression: UNCOMPRESSED (1)
+        // `type` is field 8 (REGULAR = 0, the default) so it is omitted.
+        // NOTE: field 2 is `optimizations` and field 3 is `compression`
+        // (both messages) -- do NOT emit raw strings/enums there; bundletool
+        // fails to parse the bundle otherwise.
         const BUNDLE_CONFIG_PB: &[u8] = &[
             0x0A, 0x08, // field 1 (bundletool), length 8
-            0x0A, 0x06, // sub-field 1 (version), length 6
+            0x12, 0x06, // sub-field 2 (version), length 6
             0x31, 0x2E, 0x31, 0x35, 0x2E, 0x30, // "1.15.0"
-            0x12, 0x07, // field 2 (type), length 7
-            0x52, 0x45, 0x47, 0x55, 0x4C, 0x41, 0x52, // "REGULAR"
-            0x18, 0x01, // field 3 (compression) = UNCOMPRESSED (1)
         ];
         {
             let opts: FileOptions<'_, ExtendedFileOptions> = FileOptions::default()
@@ -490,6 +489,12 @@ impl<'a> UnsignedApk<'a> {
     }
 
     pub fn sign(self, key: Key) -> Result<Apk, NdkError> {
+        // AABs are plain JARs: Google requires `jarsigner`, and `apksigner`
+        // refuses them ("Missing AndroidManifest.xml"). APKs keep apksigner.
+        if self.0.format == BuildFormat::Aab {
+            return self.sign_aab(key);
+        }
+
         let mut apksigner = self.0.build_tool(bat!("apksigner"))?;
 
         apksigner.env("CARGO_RAPK_KS_PASS", &key.password);
@@ -499,6 +504,9 @@ impl<'a> UnsignedApk<'a> {
             .arg(&key.path)
             .arg("--ks-pass")
             .arg("env:CARGO_RAPK_KS_PASS");
+        if let Some(alias) = key.alias.as_deref().filter(|a| !a.is_empty()) {
+            apksigner.arg("--ks-key-alias").arg(alias);
+        }
 
         if self.0.normalize_zip {
             apksigner
@@ -516,6 +524,29 @@ impl<'a> UnsignedApk<'a> {
 
         if !apksigner.status()?.success() {
             return Err(NdkError::CmdFailed(Box::new(apksigner)));
+        }
+        Ok(Apk::from_config(self.0))
+    }
+
+    /// Sign an AAB with `jarsigner` (JAR signing scheme).
+    fn sign_aab(self, key: Key) -> Result<Apk, NdkError> {
+        let alias = key
+            .alias
+            .as_deref()
+            .filter(|a| !a.is_empty())
+            .ok_or(NdkError::MissingKeyAlias(self.0.apk_name.clone()));
+        let mut jarsigner = self.0.ndk.jarsigner()?;
+        jarsigner.env("CARGO_RAPK_KS_PASS", &key.password);
+        jarsigner
+            .arg("-keystore")
+            .arg(&key.path)
+            .arg("-storepass:env")
+            .arg("CARGO_RAPK_KS_PASS")
+            .arg(self.0.output_path())
+            .arg(alias?);
+
+        if !jarsigner.status()?.success() {
+            return Err(NdkError::CmdFailed(Box::new(jarsigner)));
         }
         Ok(Apk::from_config(self.0))
     }

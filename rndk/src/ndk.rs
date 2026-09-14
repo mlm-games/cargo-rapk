@@ -556,6 +556,10 @@ impl Ndk {
         self.java_tool("keytool")
     }
 
+    pub fn jarsigner(&self) -> Result<Command, NdkError> {
+        self.java_tool("jarsigner")
+    }
+
     pub fn javac(&self) -> Result<Command, NdkError> {
         self.java_tool("javac")
     }
@@ -653,7 +657,11 @@ impl Ndk {
                 return Err(NdkError::CmdFailed(Box::new(keytool)));
             }
         }
-        Ok(Key { path, password })
+        Ok(Key {
+            path,
+            password,
+            alias: Some("androiddebugkey".to_owned()),
+        })
     }
 
     pub fn sysroot_lib_dir(&self, target: Target) -> Result<PathBuf, NdkError> {
@@ -726,6 +734,9 @@ impl Ndk {
 pub struct Key {
     pub path: PathBuf,
     pub password: String,
+    /// Key alias inside the keystore (required by `jarsigner` for AABs;
+    /// `apksigner` picks it up via `--ks-key-alias` when set).
+    pub alias: Option<String>,
 }
 
 #[cfg(test)]

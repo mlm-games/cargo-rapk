@@ -439,22 +439,38 @@ impl<'a> ApkBuilder<'a> {
             profile_name.to_uppercase().replace('-', "_")
         );
         let password_env = format!("{keystore_env}_PASSWORD");
+        let alias_env = format!("{keystore_env}_ALIAS");
         let path = std::env::var_os(&keystore_env).map(PathBuf::from);
         let password = std::env::var(&password_env).ok();
+        let alias = std::env::var(&alias_env)
+            .ok()
+            .filter(|a| !a.is_empty())
+            .or_else(|| {
+                self.manifest
+                    .signing
+                    .get(profile_name)
+                    .and_then(|msk| msk.alias.clone())
+            });
         let signing_key = match (path, password) {
-            (Some(path), Some(password)) => Key { path, password },
+            (Some(path), Some(password)) => Key {
+                path,
+                password,
+                alias,
+            },
             (Some(path), None) if *self.cmd.profile() == Profile::Dev => Key {
                 path,
                 password: rndk::ndk::DEFAULT_DEV_KEYSTORE_PASSWORD.to_owned(),
+                alias,
             },
             (Some(_path), None) => {
-                return Err(Error::MissingKeystorePassword(profile_name.to_owned()));
+                return Err(Error::MissingKeystorePassword(profile_name.into()));
             }
             (None, _) => {
                 if let Some(msk) = self.manifest.signing.get(profile_name) {
                     Key {
                         path: crate_path.join(&msk.path),
                         password: msk.keystore_password.clone(),
+                        alias: msk.alias.clone(),
                     }
                 } else if *self.cmd.profile() == Profile::Dev {
                     self.ndk.debug_key()?
@@ -463,6 +479,13 @@ impl<'a> ApkBuilder<'a> {
                 }
             }
         };
+
+        if self.format == BuildFormat::Aab && signing_key.alias.is_none() {
+            return Err(Error::MissingKeystoreAlias {
+                profile_env: profile_name.into(),
+                profile: profile_name.to_owned(),
+            });
+        }
 
         println!(
             "Signing `{}` with keystore `{}`",

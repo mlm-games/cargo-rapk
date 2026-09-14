@@ -57,6 +57,10 @@ pub enum NdkError {
     KotlinChecksumMismatch { expected: String, actual: String },
     #[error("Java runtime for Kotlin compiler: {0}")]
     KotlinJavaMissing(String),
+    #[error(
+        "No key alias configured for `{0}`; set it via `CARGO_RAPK_<PROFILE>_KEYSTORE_ALIAS` or `[package.metadata.android.signing.<profile>] alias` (required for AAB signing)"
+    )]
+    MissingKeyAlias(String),
     #[error(transparent)]
     Serialize(#[from] SeError),
     #[error("String `{1}` is not a UID")]

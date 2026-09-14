@@ -24,7 +24,14 @@ pub enum Error {
     #[error("Configure a release keystore via `[package.metadata.android.signing.{0}]`")]
     MissingReleaseKey(String),
     #[error("Set the keystore password via CARGO_RAPK_{0}_KEYSTORE_PASSWORD")]
-    MissingKeystorePassword(String),
+    MissingKeystorePassword(UpperProfile),
+    #[error(
+        "Set the key alias via CARGO_RAPK_{profile_env}_KEYSTORE_ALIAS or `[package.metadata.android.signing.{profile}] alias` (required for AAB since jarsigner needs an alias)"
+    )]
+    MissingKeystoreAlias {
+        profile_env: UpperProfile,
+        profile: String,
+    },
     #[error("`workspace=false` is unsupported")]
     InheritedFalse,
     #[error("`workspace=true` requires a workspace")]
@@ -42,5 +49,29 @@ pub enum Error {
 impl Error {
     pub fn invalid_args() -> Self {
         Self::Subcommand(SubcommandError::InvalidArgs)
+    }
+}
+
+/// Profile name normalized the same way env vars are built
+/// (`profile.to_uppercase().replace('-', "_")`), so error messages name the
+/// actual `CARGO_RAPK_<PROFILE>_...` variable.
+#[derive(Debug, Clone)]
+pub struct UpperProfile(String);
+
+impl std::fmt::Display for UpperProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for UpperProfile {
+    fn from(profile_name: String) -> Self {
+        Self::from(profile_name.as_str())
+    }
+}
+
+impl From<&str> for UpperProfile {
+    fn from(profile_name: &str) -> Self {
+        Self(profile_name.to_uppercase().replace('-', "_"))
     }
 }

@@ -145,6 +145,8 @@ where
 pub(crate) struct Signing {
     pub(crate) path: PathBuf,
     pub(crate) keystore_password: String,
+    #[serde(default)]
+    pub(crate) alias: Option<String>,
 }
 
 #[cfg(test)]
