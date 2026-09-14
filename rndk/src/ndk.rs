@@ -661,6 +661,8 @@ impl Ndk {
             path,
             password,
             alias: Some("androiddebugkey".to_owned()),
+            // Debug keys use the same password for keystore and key.
+            key_password: None,
         })
     }
 
@@ -737,6 +739,9 @@ pub struct Key {
     /// Key alias inside the keystore (required by `jarsigner` for AABs;
     /// `apksigner` picks it up via `--ks-key-alias` when set).
     pub alias: Option<String>,
+    /// Password for the private key itself, if different from the keystore
+    /// password. Passed to `jarsigner -keypass` for AABs.
+    pub key_password: Option<String>,
 }
 
 #[cfg(test)]

@@ -147,6 +147,10 @@ pub(crate) struct Signing {
     pub(crate) keystore_password: String,
     #[serde(default)]
     pub(crate) alias: Option<String>,
+    /// Password for the private key itself, if different from the keystore
+    /// password (`ANDROID_KEY_PASSWORD` in CI).
+    #[serde(default)]
+    pub(crate) key_password: Option<String>,
 }
 
 #[cfg(test)]

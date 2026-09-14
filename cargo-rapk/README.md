@@ -149,9 +149,11 @@ shared_user_id = "my.shared.user.id"
 # The keystore path can be absolute, or relative to the Cargo.toml file.
 #
 # The environment variables `CARGO_RAPK_<PROFILE>_KEYSTORE`,
-# `CARGO_RAPK_<PROFILE>_KEYSTORE_PASSWORD` and (for AABs, required)
-# `CARGO_RAPK_<PROFILE>_KEYSTORE_ALIAS` can be set to a keystore path,
-# keystore password and key alias respectively. The profile portion follows
+# `CARGO_RAPK_<PROFILE>_KEYSTORE_PASSWORD`, (for AABs, required)
+# `CARGO_RAPK_<PROFILE>_KEYSTORE_ALIAS` and (only when the key password differs
+# from the keystore password) `CARGO_RAPK_<PROFILE>_KEYSTORE_KEY_PASSWORD` can
+# be set to a keystore path, keystore password, key alias and key password
+# respectively. The profile portion follows
 # the same rules as `<cfg>`, it is the uppercased profile name with `-`
 # replaced with `_`.
 #
@@ -165,6 +167,8 @@ keystore_password = "android"
 # Required when building `--format aab` (ignored for APKs by apksigner
 # unless the keystore holds multiple keys).
 alias = "mykey"
+# Only needed when the key password differs from the keystore password.
+key_password = "android"
 
 # See https://developer.android.com/guide/topics/manifest/uses-sdk-element
 #

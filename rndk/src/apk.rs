@@ -507,6 +507,10 @@ impl<'a> UnsignedApk<'a> {
         if let Some(alias) = key.alias.as_deref().filter(|a| !a.is_empty()) {
             apksigner.arg("--ks-key-alias").arg(alias);
         }
+        if let Some(key_pass) = key.key_password.as_deref().filter(|p| !p.is_empty()) {
+            apksigner.env("CARGO_RAPK_KEY_PASS", key_pass);
+            apksigner.arg("--key-pass").arg("env:CARGO_RAPK_KEY_PASS");
+        }
 
         if self.0.normalize_zip {
             apksigner
@@ -541,9 +545,12 @@ impl<'a> UnsignedApk<'a> {
             .arg("-keystore")
             .arg(&key.path)
             .arg("-storepass:env")
-            .arg("CARGO_RAPK_KS_PASS")
-            .arg(self.0.output_path())
-            .arg(alias?);
+            .arg("CARGO_RAPK_KS_PASS");
+        if let Some(key_pass) = key.key_password.as_deref().filter(|p| !p.is_empty()) {
+            jarsigner.env("CARGO_RAPK_KEY_PASS", key_pass);
+            jarsigner.arg("-keypass:env").arg("CARGO_RAPK_KEY_PASS");
+        }
+        jarsigner.arg(self.0.output_path()).arg(alias?);
 
         if !jarsigner.status()?.success() {
             return Err(NdkError::CmdFailed(Box::new(jarsigner)));

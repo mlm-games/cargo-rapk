@@ -440,8 +440,12 @@ impl<'a> ApkBuilder<'a> {
         );
         let password_env = format!("{keystore_env}_PASSWORD");
         let alias_env = format!("{keystore_env}_ALIAS");
+        let key_password_env = format!("{keystore_env}_KEY_PASSWORD");
         let path = std::env::var_os(&keystore_env).map(PathBuf::from);
         let password = std::env::var(&password_env).ok();
+        let key_password = std::env::var(&key_password_env)
+            .ok()
+            .filter(|p| !p.is_empty());
         let alias = std::env::var(&alias_env)
             .ok()
             .filter(|a| !a.is_empty())
@@ -456,11 +460,13 @@ impl<'a> ApkBuilder<'a> {
                 path,
                 password,
                 alias,
+                key_password,
             },
             (Some(path), None) if *self.cmd.profile() == Profile::Dev => Key {
                 path,
                 password: rndk::ndk::DEFAULT_DEV_KEYSTORE_PASSWORD.to_owned(),
                 alias,
+                key_password,
             },
             (Some(_path), None) => {
                 return Err(Error::MissingKeystorePassword(profile_name.into()));
@@ -471,6 +477,7 @@ impl<'a> ApkBuilder<'a> {
                         path: crate_path.join(&msk.path),
                         password: msk.keystore_password.clone(),
                         alias: msk.alias.clone(),
+                        key_password: msk.key_password.clone().or(key_password),
                     }
                 } else if *self.cmd.profile() == Profile::Dev {
                     self.ndk.debug_key()?
