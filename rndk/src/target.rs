@@ -36,6 +36,16 @@ impl Target {
         }
     }
 
+    /// Offset added to the base `version_code` for per-ABI split APKs.
+    pub fn version_code_offset(self) -> i32 {
+        match self {
+            Self::X86 => -3,
+            Self::X86_64 => -2,
+            Self::ArmV7a => -1,
+            Self::Arm64V8a => 0,
+        }
+    }
+
     /// Returns the triple used by the rust build tools
     pub fn rust_triple(self) -> &'static str {
         match self {

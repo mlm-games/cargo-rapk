@@ -513,6 +513,12 @@ pub struct Sdk {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_sdk_version: Option<u32>,
+    /// Optional base `version_code` override, read from
+    /// `[package.metadata.android.sdk]`. When absent, the base is derived
+    /// from the package semver. Never serialized: it is not part of the
+    /// `uses-sdk` element.
+    #[serde(default, skip_serializing)]
+    pub version_code: Option<u32>,
 }
 
 impl Default for Sdk {
@@ -521,6 +527,7 @@ impl Default for Sdk {
             min_sdk_version: Some(23),
             target_sdk_version: None,
             max_sdk_version: None,
+            version_code: None,
         }
     }
 }

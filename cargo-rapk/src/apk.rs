@@ -47,6 +47,7 @@ pub struct ApkBuilder<'a> {
     cmd: &'a Subcommand,
     ndk: Ndk,
     manifest: Manifest,
+    base_version_code: u32,
     build_dir: PathBuf,
     build_targets: Vec<Target>,
     device_serial: Option<String>,
@@ -100,7 +101,11 @@ impl<'a> ApkBuilder<'a> {
             }
             Inheritable::Inherited { workspace: false } => return Err(Error::InheritedFalse),
         };
-        let version_code = VersionCode::from_semver(&package_version)?.to_code(1);
+        let version_code = manifest
+            .android_manifest
+            .sdk
+            .version_code
+            .unwrap_or(VersionCode::from_semver(&package_version)?.to_code(1));
 
         if manifest
             .android_manifest
@@ -110,12 +115,7 @@ impl<'a> ApkBuilder<'a> {
         {
             return Err(Error::VersionNameSet);
         }
-        if manifest
-            .android_manifest
-            .version_code
-            .replace(version_code)
-            .is_some()
-        {
+        if manifest.android_manifest.version_code.is_some() {
             return Err(Error::VersionCodeSet);
         }
 
@@ -135,6 +135,7 @@ impl<'a> ApkBuilder<'a> {
             cmd,
             ndk,
             manifest,
+            base_version_code: version_code,
             build_dir,
             build_targets,
             device_serial,
@@ -207,6 +208,7 @@ impl<'a> ApkBuilder<'a> {
 
     pub fn build(&self, artifact: &Artifact) -> Result<Apk, Error> {
         let mut manifest = self.manifest.android_manifest.clone();
+        manifest.version_code = Some(self.version_code());
         if manifest.package.is_empty() {
             let name = artifact.name.replace('-', "_");
             manifest.package = match artifact.r#type {
@@ -568,6 +570,18 @@ impl<'a> ApkBuilder<'a> {
             }
         }
         Ok(())
+    }
+
+    fn version_code(&self) -> u32 {
+        let base = i64::from(self.base_version_code);
+        let offset = if self.universal {
+            1
+        } else if let [target] = self.build_targets.as_slice() {
+            i64::from(target.version_code_offset())
+        } else {
+            0
+        };
+        base.saturating_add(offset).max(1) as u32
     }
 
     /// Returns `minSdkVersion` for use in compiler target selection:
