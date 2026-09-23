@@ -397,8 +397,18 @@ pub struct IntentFilterData {
 pub struct MetaData {
     #[serde(rename(serialize = "@android:name"))]
     pub name: String,
-    #[serde(rename(serialize = "@android:value"))]
-    pub value: String,
+    #[serde(
+        rename(serialize = "@android:value"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub value: Option<String>,
+    /// A reference to a resource, such as the `@xml/device_filter` that a
+    /// `USB_DEVICE_ATTACHED` intent filter reads its device list from.
+    #[serde(
+        rename(serialize = "@android:resource"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resource: Option<String>,
 }
 
 /// Android [uses-feature element](https://developer.android.com/guide/topics/manifest/uses-feature-element).
@@ -542,4 +552,46 @@ fn default_activity_name() -> String {
 
 fn default_config_changes() -> Option<String> {
     Some("orientation|keyboardHidden|screenSize".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn activity_xml(toml_source: &str) -> String {
+        let activity: Activity = toml::from_str(toml_source).unwrap();
+        quick_xml::se::to_string(&activity).unwrap()
+    }
+
+    #[test]
+    fn meta_data_can_reference_a_resource() {
+        let xml = activity_xml(
+            r#"
+            [[meta_data]]
+            name = "android.hardware.usb.action.USB_DEVICE_ATTACHED"
+            resource = "@xml/device_filter"
+            "#,
+        );
+
+        assert!(xml.contains(
+            r#"<meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" android:resource="@xml/device_filter"/>"#
+        ));
+        assert!(!xml.contains("android:value"));
+    }
+
+    #[test]
+    fn meta_data_values_are_unchanged() {
+        let xml = activity_xml(
+            r#"
+            [[meta_data]]
+            name = "android.app.lib_name"
+            value = "example"
+            "#,
+        );
+
+        assert!(xml.contains(
+            r#"<meta-data android:name="android.app.lib_name" android:value="example"/>"#
+        ));
+        assert!(!xml.contains("android:resource"));
+    }
 }

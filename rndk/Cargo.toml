@@ -21,3 +21,6 @@ time = { version = "0.3", default-features = false, features = ["formatting"] }
 which = "8"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 log = "0.4.32"
+
+[dev-dependencies]
+toml = "1.1.6"
