@@ -367,7 +367,7 @@ impl<'a> UnalignedApk<'a> {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(16);
         let bt_ver = self.config.ndk.build_tools_version();
-        if bt_ver >= "35.0.0" {
+        if self.config.ndk.build_tools_at_least((35, 0, 0)) {
             zipalign.arg("-P").arg(page_size_kb.to_string());
         } else {
             eprintln!(
@@ -495,7 +495,8 @@ impl<'a> UnsignedApk<'a> {
             return self.sign_aab(key);
         }
 
-        let mut apksigner = self.0.build_tool(bat!("apksigner"))?;
+        let mut apksigner = self.0.ndk.apksigner()?;
+        apksigner.current_dir(&self.0.build_dir);
 
         apksigner.env("CARGO_RAPK_KS_PASS", &key.password);
         apksigner

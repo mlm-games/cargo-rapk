@@ -44,6 +44,10 @@ pub enum Error {
     VersionNameSet,
     #[error("`version_code` must not be set manually; it is derived from the package version")]
     VersionCodeSet,
+    #[error(
+        "No buildable artifacts: `cargo rapk` needs a `cdylib` library target (select it with `--lib`), example, or binary"
+    )]
+    NoArtifacts,
 }
 
 impl Error {

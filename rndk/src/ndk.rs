@@ -9,6 +9,8 @@ use std::process::Command;
 /// [`Ndk::debug_key`]
 pub const DEFAULT_DEV_KEYSTORE_PASSWORD: &str = "android";
 
+const D8_MAIN_CLASS: &str = "com.android.tools.r8.D8";
+
 fn is_tty() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -295,10 +297,13 @@ impl Ndk {
             .filter(|level| *level >= min_platform_level)
             .collect();
 
-        let excess: Vec<&u32> = platforms
+        let mut excess: Vec<u32> = platforms
             .iter()
-            .filter(|l| **l > max_platform_level)
+            .copied()
+            .filter(|l| *l > max_platform_level)
             .collect();
+        excess.sort_unstable();
+        excess.dedup();
         if !excess.is_empty() {
             eprintln!(
                 "warning: SDK has platforms ({}) newer than NDK max platform level ({})",
@@ -337,6 +342,11 @@ impl Ndk {
         &self.build_tools_version
     }
 
+    pub fn build_tools_at_least(&self, min: (u32, u32, u32)) -> bool {
+        parse_pkg_revision(&self.build_tools_version)
+            .is_some_and(|(ma, mi, pa, _)| (ma, mi, pa) >= min)
+    }
+
     pub fn build_tag(&self) -> u32 {
         self.build_tag
     }
@@ -345,16 +355,30 @@ impl Ndk {
         &self.platforms
     }
 
-    pub fn build_tool(&self, tool: &str) -> Result<Command, NdkError> {
-        let path = self
-            .sdk_path
+    fn build_tools_dir(&self) -> PathBuf {
+        self.sdk_path
             .join("build-tools")
             .join(&self.build_tools_version)
-            .join(tool);
+    }
+
+    pub fn build_tool(&self, tool: &str) -> Result<Command, NdkError> {
+        Ok(Command::new(self.build_tool_path(tool)?))
+    }
+
+    pub fn build_tool_path(&self, tool: &str) -> Result<PathBuf, NdkError> {
+        let path = self.build_tools_dir().join(tool);
         if !path.exists() {
             return Err(NdkError::CmdNotFound(tool.to_string()));
         }
-        Ok(Command::new(dunce::canonicalize(path)?))
+        Ok(dunce::canonicalize(path)?)
+    }
+
+    fn build_tool_jar(&self, jar: &str) -> Result<PathBuf, NdkError> {
+        let path = self.build_tools_dir().join("lib").join(jar);
+        if !path.is_file() {
+            return Err(NdkError::PathNotFound(path));
+        }
+        Ok(path)
     }
 
     pub fn platform_tool_path(&self, tool: &str) -> Result<PathBuf, NdkError> {
@@ -566,34 +590,29 @@ impl Ndk {
 
     pub fn d8(&self) -> Result<Command, NdkError> {
         if let Ok(jar) = std::env::var("ANDROID_D8_JAR") {
-            let jar_path = PathBuf::from(&jar);
-            if jar_path.is_file() {
-                let java = which::which("java").or_else(|_| -> Result<PathBuf, ()> {
-                    let java_home = std::env::var("JAVA_HOME").map_err(|_| ())?;
-                    let candidate = PathBuf::from(java_home).join("bin").join("java");
-                    if cfg!(target_os = "windows") {
-                        let candidate_exe = candidate.with_extension("exe");
-                        if candidate_exe.is_file() {
-                            return Ok(candidate_exe);
-                        }
-                    }
-                    if candidate.is_file() {
-                        return Ok(candidate);
-                    }
-                    Err(())
-                });
-                if let Ok(java) = java {
-                    let mut cmd = Command::new(java);
-                    cmd.arg("-cp").arg(&jar_path).arg("com.android.tools.r8.D8");
-                    return Ok(cmd);
-                }
-                return Err(NdkError::CmdNotFound("java".to_string()));
+            let jar = PathBuf::from(jar);
+            if jar.is_file() {
+                return Self::java_classpath(&jar, D8_MAIN_CLASS, "-Xmx2G");
             }
         }
-        self.build_tool(bat!("d8"))
+        let jar = self.build_tool_jar("d8.jar")?;
+        Self::java_classpath(&jar, D8_MAIN_CLASS, "-Xmx2G")
     }
 
-    fn java_tool(&self, tool: &str) -> Result<Command, NdkError> {
+    pub fn apksigner(&self) -> Result<Command, NdkError> {
+        let jar = self.build_tool_jar("apksigner.jar")?;
+        let mut cmd = Command::new(Self::java_tool_path("java")?);
+        cmd.arg("-Xmx1024M").arg("-jar").arg(jar);
+        Ok(cmd)
+    }
+
+    fn java_classpath(jar: &Path, main_class: &str, max_heap: &str) -> Result<Command, NdkError> {
+        let mut cmd = Command::new(Self::java_tool_path("java")?);
+        cmd.arg(max_heap).arg("-cp").arg(jar).arg(main_class);
+        Ok(cmd)
+    }
+
+    fn java_tool_path(tool: &str) -> Result<PathBuf, NdkError> {
         let tool_bin = if cfg!(target_os = "windows") {
             format!("{tool}.exe")
         } else {
@@ -601,15 +620,19 @@ impl Ndk {
         };
 
         if let Ok(path) = which::which(&tool_bin) {
-            return Ok(Command::new(path));
+            return Ok(path);
         }
         if let Ok(java_home) = std::env::var("JAVA_HOME") {
             let candidate = PathBuf::from(java_home).join("bin").join(&tool_bin);
             if candidate.exists() {
-                return Ok(Command::new(candidate));
+                return Ok(candidate);
             }
         }
         Err(NdkError::CmdNotFound(tool.to_string()))
+    }
+
+    fn java_tool(&self, tool: &str) -> Result<Command, NdkError> {
+        Ok(Command::new(Self::java_tool_path(tool)?))
     }
 
     /// kotlinc, fetching into cache if `.kt` needs it. Pure `.java` never calls this.

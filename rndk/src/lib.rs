@@ -7,15 +7,6 @@ macro_rules! bin {
         }
     };
 }
-macro_rules! bat {
-    ($bat:expr) => {
-        if cfg!(target_os = "windows") {
-            concat!($bat, ".bat")
-        } else {
-            $bat
-        }
-    };
-}
 macro_rules! cmd {
     ($cmd:expr) => {
         if cfg!(target_os = "windows") {

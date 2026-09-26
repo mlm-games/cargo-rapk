@@ -210,7 +210,11 @@ fn main() -> anyhow::Result<()> {
         }
         RapkSubCmd::Build { args } => {
             prepare!(args, cmd, builder);
-            for artifact in cmd.artifacts() {
+            let artifacts: Vec<_> = cmd.artifacts().collect();
+            if artifacts.is_empty() {
+                return Err(Error::NoArtifacts.into());
+            }
+            for artifact in artifacts {
                 builder.build(artifact)?;
             }
         }
