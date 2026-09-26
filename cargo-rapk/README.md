@@ -245,7 +245,7 @@ uses_cleartext_traffic = true
 # See https://developer.android.com/guide/topics/manifest/meta-data-element
 #
 # Note: there can be several .meta_data entries.
-# Note: the `resource` attribute is currently not supported.
+# Note: an entry sets either `value` or `resource`, as for activities below.
 [[package.metadata.android.application.meta_data]]
 name = "com.samsung.android.vr.application.mode"
 value = "vr_only"
@@ -293,10 +293,16 @@ always_retain_task_state = true
 # See https://developer.android.com/guide/topics/manifest/meta-data-element
 #
 # Note: there can be several .meta_data entries.
-# Note: the `resource` attribute is currently not supported.
+# Note: an entry sets either `value` or `resource`.
 [[package.metadata.android.application.activity.meta_data]]
 name = "com.oculus.vr.focusaware"
 value = "true"
+
+# A `resource` refers to a file under the resources folder, such as the device
+# list a USB_DEVICE_ATTACHED intent filter needs (`res/xml/device_filter.xml`).
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.hardware.usb.action.USB_DEVICE_ATTACHED"
+resource = "@xml/device_filter"
 
 # See https://developer.android.com/guide/topics/manifest/intent-filter-element
 #

@@ -298,7 +298,8 @@ impl<'a> ApkBuilder<'a> {
         let lib_name = artifact.name.replace('-', "_");
         let lib_name_meta = MetaData {
             name: "android.app.lib_name".to_string(),
-            value: lib_name,
+            value: Some(lib_name),
+            resource: None,
         };
         let mut attached_to_native_activity = false;
         for activity in &mut manifest.application.activity {
