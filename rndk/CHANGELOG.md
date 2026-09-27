@@ -7,6 +7,7 @@
 - Add `uses-native-library` and `profileable` elements, a `receiver` element, and the `android:installLocation`, `android:requestLegacyExternalStorage` and `android:allowNativeHeapPointerTagging` attributes on `Application`. ([#87](https://github.com/rust-mobile/cargo-apk/pull/87), [#85](https://github.com/rust-mobile/cargo-apk/pull/85), [#58](https://github.com/rust-mobile/cargo-apk/pull/58), [#81](https://github.com/rust-mobile/cargo-apk/issues/81))
 - Install, launch and look up the uid under the device's current user, so that multi-user devices with a work profile no longer report another user's uid. ([#57](https://github.com/rust-mobile/cargo-apk/pull/57))
 - Do not copy permission bits when adding a library to the APK, so that a rebuild does not fail against a read-only source such as a Nix store SDK. ([#21](https://github.com/rust-mobile/cargo-apk/pull/21))
+- Report a non-UTF-8 path or command output, and a `SOURCE_DATE_EPOCH` outside the range a zip entry can represent, as errors instead of panicking or silently falling back to the DOS epoch.
 
 # 0.10.0 (2023-11-30)
 

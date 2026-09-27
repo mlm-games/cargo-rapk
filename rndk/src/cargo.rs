@@ -115,7 +115,7 @@ pub fn cargo_ndk(
         rustflags.push_str(
             cargo_rapk_link_dir
                 .to_str()
-                .expect("Target dir must be valid UTF-8"),
+                .ok_or_else(|| NdkError::NonUtf8Path(cargo_rapk_link_dir.clone()))?,
         );
     }
 
@@ -129,7 +129,7 @@ pub fn cargo_ndk(
         }
         if let Some(p) = pwd {
             rustflags.push_str("--remap-path-prefix=");
-            rustflags.push_str(p.to_str().unwrap());
+            rustflags.push_str(p.to_str().ok_or_else(|| NdkError::NonUtf8Path(p.clone()))?);
             rustflags.push_str("=/src");
             rustflags.push_str(SEP);
         }

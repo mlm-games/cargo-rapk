@@ -57,6 +57,14 @@ pub enum NdkError {
     IoPathError(PathBuf, #[source] IoError),
     #[error("Invalid semver")]
     InvalidSemver,
+    #[error("Path `{0:?}` is not valid UTF-8")]
+    NonUtf8Path(PathBuf),
+    #[error("Output of `{0}` is not valid UTF-8")]
+    NonUtf8Output(&'static str),
+    #[error("Timestamp {0} is out of the range a zip entry can represent (1980-2107)")]
+    TimestampOutOfRange(i64),
+    #[error("Failed to read or rewrite the zip archive: {0}")]
+    Zip(#[from] zip::result::ZipError),
     #[error("Environment variable `{0}` contains non-unicode characters")]
     NonUnicodeEnvVar(&'static str),
     #[error("Command `{}` had a non-zero exit code.", format!("{:?}", .0).replace('"', ""))]

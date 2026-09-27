@@ -182,8 +182,16 @@ impl<'a> ApkBuilder<'a> {
         };
     }
 
+    /// The directory relative paths in the manifest resolve against.
+    fn crate_path(&self) -> Result<&Path, Error> {
+        self.cmd
+            .manifest()
+            .parent()
+            .ok_or_else(|| Error::MissingManifestParent(self.cmd.manifest().to_path_buf()))
+    }
+
     fn java_sources(&self) -> Result<Vec<PathBuf>, Error> {
-        let crate_path = self.cmd.manifest().parent().expect("invalid manifest path");
+        let crate_path = self.crate_path()?;
         let mut java_sources = self
             .manifest
             .java_sources
@@ -361,7 +369,7 @@ impl<'a> ApkBuilder<'a> {
         if manifest.application.label.is_empty() {
             manifest.application.label = artifact.name.to_string();
         }
-        let crate_path = self.cmd.manifest().parent().expect("invalid manifest path");
+        let crate_path = self.crate_path()?;
 
         let java_sources = self.java_sources()?;
 
@@ -445,7 +453,11 @@ impl<'a> ApkBuilder<'a> {
             }
         }
         if !attached_to_native_activity {
-            manifest.application.activity[0]
+            manifest
+                .application
+                .activity
+                .first_mut()
+                .ok_or(Error::NoActivities)?
                 .meta_data
                 .push(lib_name_meta);
         }

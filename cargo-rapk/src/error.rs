@@ -13,6 +13,8 @@ pub enum Error {
     Config(#[from] TomlError),
     #[error("Manifest `{0}` must contain a `[package]` table")]
     MissingPackageTable(std::path::PathBuf),
+    #[error("Manifest path `{0}` has no parent directory to resolve relative paths against")]
+    MissingManifestParent(std::path::PathBuf),
     #[error(transparent)]
     Ndk(#[from] NdkError),
     #[error(transparent)]
@@ -48,6 +50,8 @@ pub enum Error {
         "No buildable artifacts: `cargo rapk` needs a `cdylib` library target (select it with `--lib`), example, or binary"
     )]
     NoArtifacts,
+    #[error("No activity to attach `android.app.lib_name` to")]
+    NoActivities,
     #[error("Preflight found problems that would fail the build:\n{}", .0.join("\n"))]
     Preflight(Vec<String>),
 }

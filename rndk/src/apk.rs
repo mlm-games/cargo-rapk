@@ -37,6 +37,13 @@ fn set_readable(path: &Path) -> Result<(), NdkError> {
     Ok(())
 }
 
+/// Archive entry names are always `/`-separated, whatever the host uses.
+fn to_unix_separators(path: &Path) -> Result<String, NdkError> {
+    path.to_str()
+        .map(|path| path.replace('\\', "/"))
+        .ok_or_else(|| NdkError::NonUtf8Path(path.into()))
+}
+
 /// The options for how to treat debug symbols that are present in any `.so`
 /// files that are added to the APK.
 ///
@@ -229,9 +236,15 @@ impl<'a> UnalignedApk<'a> {
             return Err(NdkError::PathNotFound(path.into()));
         }
         let abi = target.android_abi();
-        let lib_path = Path::new("lib").join(abi).join(path.file_name().unwrap());
+        let name = path
+            .file_name()
+            .ok_or_else(|| NdkError::PathNotFound(path.into()))?;
+        let lib_path = Path::new("lib").join(abi).join(name);
         let out = self.config.build_dir.join(&lib_path);
-        std::fs::create_dir_all(out.parent().unwrap())?;
+        let out_parent = out
+            .parent()
+            .ok_or_else(|| NdkError::PathNotFound(out.clone()))?;
+        std::fs::create_dir_all(out_parent)?;
 
         match self.config.strip {
             StripConfig::Default => {
@@ -280,7 +293,7 @@ impl<'a> UnalignedApk<'a> {
         // Pass UNIX path separators to `aapt` on non-UNIX systems, ensuring the resulting separator
         // is compatible with the target device instead of the host platform.
         // Otherwise, it results in a runtime error when loading the NativeActivity `.so` library.
-        let lib_path_unix = lib_path.to_str().unwrap().replace('\\', "/");
+        let lib_path_unix = to_unix_separators(&lib_path)?;
 
         let archive_path = if self.config.format == BuildFormat::Aab {
             format!("base/{lib_path_unix}")
@@ -302,7 +315,7 @@ impl<'a> UnalignedApk<'a> {
         }
         std::fs::copy(src, out)?;
 
-        let dst_unix = dst.to_string_lossy().replace('\\', "/");
+        let dst_unix = to_unix_separators(dst)?;
         let archive_path = if self.config.format == BuildFormat::Aab {
             format!("base/{dst_unix}")
         } else {
@@ -329,16 +342,11 @@ impl<'a> UnalignedApk<'a> {
         }
     }
 
-    fn dos_date_time(&self) -> DateTime {
-        self.config.zip_timestamp.map_or_else(
-            || DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("valid DOS datetime"),
-            |ts| {
-                let odt = time::OffsetDateTime::from_unix_timestamp(ts as i64)
-                    .expect("timestamp out of range for OffsetDateTime");
-                let pdt = time::PrimitiveDateTime::new(odt.date(), odt.time());
-                DateTime::try_from(pdt).unwrap_or_default()
-            },
-        )
+    fn dos_date_time(&self) -> Result<DateTime, NdkError> {
+        match self.config.zip_timestamp {
+            None => crate::zipnorm::dos_epoch(),
+            Some(ts) => crate::zipnorm::unix_ts_to_dos(ts),
+        }
     }
 
     fn finalize_apk(self) -> Result<UnsignedApk<'a>, NdkError> {
@@ -363,8 +371,7 @@ impl<'a> UnalignedApk<'a> {
             super::zipnorm::normalize_zip_in_place(
                 self.config.unaligned_apk(),
                 self.config.zip_timestamp,
-            )
-            .map_err(|e| NdkError::IoPathError(self.config.unaligned_apk(), e))?;
+            )?;
         }
 
         let mut zipalign = self.config.build_tool("zipalign")?;
@@ -398,7 +405,7 @@ impl<'a> UnalignedApk<'a> {
     }
 
     fn finalize_aab(self) -> Result<UnsignedApk<'a>, NdkError> {
-        let dos_time = self.dos_date_time();
+        let dos_time = self.dos_date_time()?;
         let file = fs::File::create(self.config.aab())?;
         let mut zip = ZipWriter::new(file);
 
@@ -484,8 +491,7 @@ impl<'a> UnalignedApk<'a> {
 
         // Normalize AAB zip if requested
         if self.config.normalize_zip {
-            super::zipnorm::normalize_zip_in_place(self.config.aab(), self.config.zip_timestamp)
-                .map_err(|e| NdkError::IoPathError(self.config.aab(), e))?;
+            super::zipnorm::normalize_zip_in_place(self.config.aab(), self.config.zip_timestamp)?;
         }
 
         Ok(UnsignedApk(self.config))
@@ -668,7 +674,7 @@ impl Apk {
         }
 
         let user = std::str::from_utf8(&output.stdout)
-            .unwrap_or_default()
+            .map_err(|_| NdkError::NonUtf8Output("adb shell am get-current-user"))?
             .trim();
         user.parse()
             .map_err(|e| NdkError::NotAUserId(e, user.to_owned()))
@@ -688,7 +694,8 @@ impl Apk {
             return Err(NdkError::CmdFailed(Box::new(adb)));
         }
 
-        let output = std::str::from_utf8(&output.stdout).unwrap();
+        let output = std::str::from_utf8(&output.stdout)
+            .map_err(|_| NdkError::NonUtf8Output("adb shell pm list package"))?;
         let (_package, uid) = output
             .lines()
             .filter_map(|line| line.split_once(' '))

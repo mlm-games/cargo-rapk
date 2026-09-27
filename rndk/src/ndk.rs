@@ -254,7 +254,7 @@ impl Ndk {
                 .filter_map(|path| path.ok())
                 .filter(|path| path.path().is_dir())
                 .filter_map(|path| path.file_name().into_string().ok())
-                .filter(|name| name.chars().next().unwrap().is_ascii_digit())
+                .filter(|name| name.starts_with(|c: char| c.is_ascii_digit()))
                 .max()
                 .ok_or_else(|| NdkError::BuildToolsNotFound(build_tools_dir.clone()))?
         };

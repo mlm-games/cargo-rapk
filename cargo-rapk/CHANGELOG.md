@@ -6,6 +6,7 @@
 - Support the `receiver` element and the `uses-native-library`, `profileable` and `install_location` manifest options. ([#85](https://github.com/rust-mobile/cargo-apk/pull/85), [#87](https://github.com/rust-mobile/cargo-apk/pull/87), [#58](https://github.com/rust-mobile/cargo-apk/pull/58))
 - Support the `request_legacy_external_storage` and `allow_native_heap_pointer_tagging` manifest options. ([#82](https://github.com/rust-mobile/cargo-apk/pull/82))
 - Bump `rndk` with 16KiB page alignment, Cargo configuration `rustflags` support, current-user `adb` operations and minor API level platform detection.
+- Report a manifest path with no parent directory, and a manifest with no activity to attach `android.app.lib_name` to, as errors instead of panicking.
 - **Breaking:** `build.rustflags` and `target.<triple>.rustflags` from the Cargo configuration are now applied to Android builds, as they already were for host builds; set `RUSTFLAGS` to keep overriding the configuration.
 
 # 0.10.0 (2023-11-30)
