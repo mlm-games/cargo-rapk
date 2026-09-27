@@ -246,6 +246,9 @@ struct Selection {
     ordering: MavenVersion,
     depth: usize,
     order: usize,
+    /// The requirement that produced this version, so that a hard range it
+    /// arrived under can be checked against the version that finally wins.
+    requirement: Requirement,
 }
 
 impl Selection {
@@ -336,6 +339,7 @@ pub fn resolve(roots: &[Coordinates]) -> Result<Vec<Resolved>, NdkError> {
         )?;
     }
     resolver.walk();
+    resolver.report_range_violations();
     Ok(resolver.results())
 }
 
@@ -362,10 +366,42 @@ struct Resolver {
     /// yet re-expands it.
     expanded: HashMap<(ModuleId, String), Vec<Exclusion>>,
     pending: VecDeque<Pending>,
+    /// Hard ranges that the selected version does not satisfy. Gradle fails
+    /// these; they are reported rather than fatal because a skewed patch level
+    /// is routine in the AndroidX POM set.
+    range_violations: Vec<RangeViolation>,
     order: usize,
 }
 
+/// A hard `[x,y]` range whose winner fell outside it.
+#[derive(Debug)]
+struct RangeViolation {
+    module: ModuleId,
+    required: String,
+    selected: String,
+}
+
 impl Resolver {
+    /// Reports every hard range the selection does not satisfy. Gradle fails
+    /// the build here; a warning is enough to make the choice visible, because
+    /// `[1.2.6,1.2.7)`-style skew is common in the AndroidX POM set and failing
+    /// outright would make the library unusable.
+    fn report_range_violations(&self) {
+        let mut reported = BTreeSet::new();
+        for violation in &self.range_violations {
+            if !reported.insert(violation.module.clone()) {
+                continue;
+            }
+            log::warn!(
+                "{}: resolved to {} but something requires the hard range {}; \
+                 newest-wins mediation cannot satisfy both",
+                violation.module,
+                violation.selected,
+                violation.required
+            );
+        }
+    }
+
     fn fail(&self, coordinates: &Coordinates, reason: impl Into<String>) -> NdkError {
         NdkError::MavenLibFailed {
             gav: coordinates.gav(),
@@ -407,16 +443,45 @@ impl Resolver {
             version: version.clone(),
             depth,
             order: self.order,
+            requirement: requirement.clone(),
         };
 
-        if self
-            .selected
-            .get(&module)
-            .is_some_and(|current| !claim.beats(current))
+        if let Some(current) = self.selected.get(&module)
+            && !claim.beats(current)
         {
+            // The claim that lost may have arrived under a hard range the
+            // winner does not satisfy. Gradle fails such a resolution; warn
+            // instead, because a single skewed patch level is routine in the
+            // AndroidX POM set and failing outright would make the whole
+            // library unusable.
+            if let Requirement::Range(range) = &requirement
+                && !range.contains(&current.ordering)
+            {
+                self.range_violations.push(RangeViolation {
+                    module: module.clone(),
+                    required: requirement.to_string(),
+                    selected: current.version.clone(),
+                });
+            }
             return Ok(());
         }
-        let first_time = self.selected.insert(module.clone(), claim).is_none();
+        let first_time = match self.selected.insert(module.clone(), claim) {
+            Some(displaced) => {
+                // The winner may fall outside a hard range the version it
+                // displaced arrived under.
+                if let Requirement::Range(range) = &displaced.requirement
+                    && !range.contains(&MavenVersion::new(&version))
+                {
+                    self.range_violations.push(RangeViolation {
+                        module: module.clone(),
+                        required: displaced.requirement.to_string(),
+                        selected: version.clone(),
+                    });
+                }
+                false
+            }
+            None => true,
+        };
         self.pending.push_back(Pending {
             module: module.clone(),
             version,
@@ -433,6 +498,7 @@ impl Resolver {
                 version: version.clone(),
                 depth,
                 order: self.order,
+                requirement: requirement.clone(),
             };
             if self
                 .selected
@@ -2313,5 +2379,144 @@ mod tests {
         ]);
         let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
         assert_eq!(resolved, ["g:root:1.0"]);
+    }
+    /// A range is resolved against the repository's version list, which is
+    /// normally fetched; tests seed it instead of going to the network.
+    fn seed_available(resolver: &mut Resolver, group: &str, artifact: &str, versions: &[&str]) {
+        resolver.available.insert(
+            ModuleId::new(group, artifact),
+            versions.iter().map(|v| MavenVersion::new(v)).collect(),
+        );
+    }
+
+    #[test]
+    fn a_hard_range_the_winner_falls_outside_is_reported() {
+        // Two surviving paths reach `c`: one asks for the hard range [1.0], the
+        // other for 2.0. Newest-wins takes 2.0, which `[1.0]` does not allow.
+        let mut resolver = offline(&[
+            (
+                "g",
+                "a",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>a</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>c</artifactId><version>[1.0]</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "g",
+                "b",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>b</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>c</artifactId><version>2.0</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            ("g", "c", "1.0", leaf()),
+            ("g", "c", "2.0", leaf()),
+        ]);
+        seed_available(&mut resolver, "g", "c", &["1.0", "2.0"]);
+        let resolved = resolve_with(&mut resolver, &[("g", "a", "1.0"), ("g", "b", "1.0")]);
+        assert!(resolved.contains(&"g:c:2.0".to_owned()), "{resolved:?}");
+        assert_eq!(
+            resolver.range_violations.len(),
+            1,
+            "{:?}",
+            resolver.range_violations
+        );
+        assert_eq!(resolver.range_violations[0].required, "[1.0]");
+        assert_eq!(resolver.range_violations[0].selected, "2.0");
+    }
+
+    #[test]
+    fn a_range_the_winner_satisfies_is_not_reported() {
+        let mut resolver = offline(&[
+            (
+                "g",
+                "a",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>a</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>c</artifactId><version>[1.0,3.0)</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "g",
+                "b",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>b</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>c</artifactId><version>2.0</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            ("g", "c", "2.0", leaf()),
+        ]);
+        seed_available(&mut resolver, "g", "c", &["2.0"]);
+        let _ = resolve_with(&mut resolver, &[("g", "a", "1.0"), ("g", "b", "1.0")]);
+        assert!(
+            resolver.range_violations.is_empty(),
+            "{:?}",
+            resolver.range_violations
+        );
+    }
+
+    #[test]
+    fn a_losing_pom_is_never_expanded_so_its_range_never_competes() {
+        // `a` wants `b:1.0`, which requires the hard range `c:[1.0]`, but
+        // `b:2.0` is also wanted and wins. Only the winner is expanded, so
+        // `[1.0]` never becomes a live constraint. This is why the AndroidX
+        // closure resolves quietly: a POM that lost is not read at all.
+        let mut resolver = offline(&[
+            (
+                "g",
+                "a",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>a</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>b</artifactId><version>1.0</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "g",
+                "b",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>b</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>c</artifactId><version>[1.0]</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "g",
+                "b",
+                "2.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>b</artifactId><version>2.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>c</artifactId><version>2.0</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            ("g", "c", "1.0", leaf()),
+            ("g", "c", "2.0", leaf()),
+        ]);
+        let resolved = resolve_with(&mut resolver, &[("g", "a", "1.0"), ("g", "b", "2.0")]);
+        assert!(resolved.contains(&"g:c:2.0".to_owned()), "{resolved:?}");
+        assert!(
+            resolver.range_violations.is_empty(),
+            "{:?}",
+            resolver.range_violations
+        );
     }
 }

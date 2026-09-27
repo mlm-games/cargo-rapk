@@ -130,15 +130,30 @@ exported = false
 # `CARGO_RAPK_FETCH_MAVEN=never|force` and `CARGO_RAPK_NO_FETCH_MAVEN=1`.
 #
 # An AAR's `res/` is compiled with `aapt2` and linked as an overlay alongside
-# the app's own `resources`, and its `AndroidManifest.xml` is merged in
-# (permissions, `meta-data` and `provider`; its `package`, version, icon, label
-# and theme are dropped, as those belong to the app). A per-library `R` class is
-# generated from the same overlay set, so `androidx.appcompat.R.id.x` resolves
-# and the ids match the shipped table.
+# the app's own `resources`. A per-library `R` class is generated from the same
+# overlay set, so `androidx.appcompat.R.id.x` resolves and the ids match the
+# shipped table.
 #
-# No transitive resolution: list every artifact you need explicitly. An AAR that
-# depends on others (`GameActivity` needs `appcompat`) will fail to link until
-# its dependencies are listed too. That is the trade. Gradle is more convenient for a large graph, not required.
+# Transitive resolution follows POMs and Gradle Module Metadata, so a single
+# entry pulls its closure: `androidx.appcompat:appcompat:1.7.0` resolves 43
+# artifacts. GMM is used when published, which is how a Kotlin Multiplatform
+# root is redirected to its `-jvm` variant. When two paths want different
+# versions of one artifact the newest wins, whatever its distance, matching
+# Gradle; a hard range the winner cannot satisfy is reported as a warning.
+# Maven artifacts at a given version are immutable, so resolution is
+# reproducible from the pins alone and no lockfile is written.
+#
+# Resolution can only follow published metadata. An artifact whose POM declares
+# no dependencies and publishes no `.module` resolves to nothing else, so
+# `androidx.games:games-activity` has to be listed alongside the libraries it
+# needs (`androidx.appcompat`); its own metadata names none.
+#
+# Merged into the app manifest: permissions, permission declarations,
+# `meta-data`, `uses-feature`, `grant-uri-permission`, and `activity`,
+# `service`, `receiver` and `provider` with their intent filters. A library's
+# `tools:node="remove"` drops its element and `tools:node="replace"` overrides
+# the app's; otherwise the app's own declaration wins. A library's `package`,
+# version, icon, label and theme are dropped, as those belong to the app.
 # `android_libs = ["org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"]
 android_libs = "org.example:some-library:1.2.3"
 

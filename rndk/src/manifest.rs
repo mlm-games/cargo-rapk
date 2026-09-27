@@ -46,6 +46,10 @@ pub struct AndroidManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permission: Vec<Permission>,
 
+    #[serde(rename(serialize = "grant-uri-permission"))]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant_uri_permission: Vec<GrantUriPermission>,
+
     #[serde(default)]
     pub queries: Option<Queries>,
 
@@ -65,6 +69,7 @@ impl Default for AndroidManifest {
             uses_feature: Default::default(),
             uses_permission: Default::default(),
             permission: Default::default(),
+            grant_uri_permission: Default::default(),
             queries: Default::default(),
             application: Default::default(),
         }
@@ -128,12 +133,18 @@ impl AndroidManifest {
         }
 
         for provider in &library.application.provider {
-            if self
+            if removed(provider.tools_node.as_deref()) {
+                continue;
+            }
+            if let Some(existing) = self
                 .application
                 .provider
-                .iter()
-                .any(|p| p.name == provider.name)
+                .iter_mut()
+                .find(|p| p.name == provider.name)
             {
+                if replaces(provider.tools_node.as_deref()) {
+                    *existing = provider.clone();
+                }
                 continue;
             }
             let mut provider = provider.clone();
@@ -152,12 +163,18 @@ impl AndroidManifest {
         }
 
         for receiver in &library.application.receiver {
-            if self
+            if removed(receiver.tools_node.as_deref()) {
+                continue;
+            }
+            if let Some(existing) = self
                 .application
                 .receiver
-                .iter()
-                .any(|r| r.name == receiver.name)
+                .iter_mut()
+                .find(|r| r.name == receiver.name)
             {
+                if replaces(receiver.tools_node.as_deref()) {
+                    *existing = receiver.clone();
+                }
                 continue;
             }
             let mut receiver = receiver.clone();
@@ -169,6 +186,73 @@ impl AndroidManifest {
                 meta_data.name = substitute_application_id(&meta_data.name, application_id);
             }
             self.application.receiver.push(receiver);
+        }
+
+        for activity in &library.application.activity {
+            if removed(activity.tools_node.as_deref()) {
+                continue;
+            }
+            if let Some(existing) = self
+                .application
+                .activity
+                .iter_mut()
+                .find(|a| a.name == activity.name)
+            {
+                if replaces(activity.tools_node.as_deref()) {
+                    *existing = activity.clone();
+                }
+                continue;
+            }
+            let mut activity = activity.clone();
+            activity.name = substitute_application_id(&activity.name, application_id);
+            for meta_data in &mut activity.meta_data {
+                meta_data.name = substitute_application_id(&meta_data.name, application_id);
+                if let Some(value) = &meta_data.value {
+                    meta_data.value = Some(substitute_application_id(value, application_id));
+                }
+            }
+            self.application.activity.push(activity);
+        }
+
+        for service in &library.application.service {
+            if removed(service.tools_node.as_deref()) {
+                continue;
+            }
+            if let Some(existing) = self
+                .application
+                .service
+                .iter_mut()
+                .find(|s| s.name == service.name)
+            {
+                if replaces(service.tools_node.as_deref()) {
+                    *existing = service.clone();
+                }
+                continue;
+            }
+            let mut service = service.clone();
+            service.name = substitute_application_id(&service.name, application_id);
+            if let Some(permission) = &service.permission {
+                service.permission = Some(substitute_application_id(permission, application_id));
+            }
+            for meta_data in &mut service.meta_data {
+                meta_data.name = substitute_application_id(&meta_data.name, application_id);
+            }
+            self.application.service.push(service);
+        }
+
+        for feature in &library.uses_feature {
+            let same = |f: &Feature| f.name == feature.name;
+            if self.uses_feature.iter().any(same) {
+                continue;
+            }
+            self.uses_feature.push(feature.clone());
+        }
+
+        for grant in &library.grant_uri_permission {
+            if self.grant_uri_permission.iter().any(|g| g.uri == grant.uri) {
+                continue;
+            }
+            self.grant_uri_permission.push(grant.clone());
         }
 
         if let Some(queries) = &library.queries {
@@ -192,6 +276,16 @@ impl AndroidManifest {
             }
         }
     }
+}
+
+/// Whether a library component asked to be dropped from the merged manifest.
+fn removed(tools_node: Option<&str>) -> bool {
+    matches!(tools_node, Some("remove") | Some("removeAll"))
+}
+
+/// Whether a library component asked to win over the app's own declaration.
+fn replaces(tools_node: Option<&str>) -> bool {
+    matches!(tools_node, Some("replace") | Some("replaceStrict"))
 }
 
 /// Resolves the placeholders a library manifest may use for the app's own id.
@@ -267,6 +361,8 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
     reader.config_mut().trim_text(true);
     let mut manifest = AndroidManifest::default();
     let mut path: Vec<String> = Vec::new();
+    let mut activity: Option<Activity> = None;
+    let mut service: Option<Service> = None;
     let mut provider: Option<Provider> = None;
     let mut receiver: Option<Receiver> = None;
     let mut filter: Option<IntentFilter> = None;
@@ -296,6 +392,16 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     Some("receiver") => {
                         if let Some(done) = receiver.take() {
                             manifest.application.receiver.push(done);
+                        }
+                    }
+                    Some("activity") => {
+                        if let Some(done) = activity.take() {
+                            manifest.application.activity.push(done);
+                        }
+                    }
+                    Some("service") => {
+                        if let Some(done) = service.take() {
+                            manifest.application.service.push(done);
                         }
                     }
                     Some("intent-filter") | Some("intent") => {
@@ -352,9 +458,72 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                 }
             }
             ("queries", "intent") if is_start => filter = Some(IntentFilter::default()),
+            ("manifest", "uses-feature") => manifest.uses_feature.push(Feature {
+                name: get(&attrs, "name").map(str::to_owned),
+                required: flag(&attrs, "required"),
+                version: number(&attrs, "version"),
+                opengles_version: None,
+            }),
+            ("manifest", "grant-uri-permission") => manifest
+                .grant_uri_permission
+                .push(GrantUriPermission { uri: named(&attrs) }),
+            ("application", "activity") => {
+                let built = Activity {
+                    name: named(&attrs),
+                    config_changes: get(&attrs, "configChanges").map(str::to_owned),
+                    label: get(&attrs, "label").map(str::to_owned),
+                    launch_mode: get(&attrs, "launchMode").map(str::to_owned),
+                    orientation: get(&attrs, "screenOrientation").map(str::to_owned),
+                    exported: flag(&attrs, "exported"),
+                    resizeable_activity: flag(&attrs, "resizeableActivity"),
+                    always_retain_task_state: flag(&attrs, "alwaysRetainTaskState"),
+                    tools_node: get(&attrs, "node").map(str::to_owned),
+                    meta_data: Vec::new(),
+                    intent_filter: Vec::new(),
+                };
+                if is_start {
+                    activity = Some(built);
+                } else {
+                    manifest.application.activity.push(built);
+                }
+            }
+            ("activity", "meta-data") => {
+                if let Some(a) = activity.as_mut() {
+                    a.meta_data.push(meta_data(&attrs));
+                }
+            }
+            ("activity", "intent-filter") if is_start => filter = Some(IntentFilter::default()),
+            ("application", "service") => {
+                let built = Service {
+                    name: named(&attrs),
+                    exported: flag(&attrs, "exported"),
+                    foreground_service_type: get(&attrs, "foregroundServiceType")
+                        .map(str::to_owned),
+                    label: get(&attrs, "label").map(str::to_owned),
+                    icon: get(&attrs, "icon").map(str::to_owned),
+                    permission: get(&attrs, "permission").map(str::to_owned),
+                    process: get(&attrs, "process").map(str::to_owned),
+                    description: get(&attrs, "description").map(str::to_owned),
+                    direct_boot_aware: flag(&attrs, "directBootAware"),
+                    tools_node: get(&attrs, "node").map(str::to_owned),
+                    meta_data: Vec::new(),
+                    intent_filter: Vec::new(),
+                };
+                if is_start {
+                    service = Some(built);
+                } else {
+                    manifest.application.service.push(built);
+                }
+            }
+            ("service", "meta-data") => {
+                if let Some(s) = service.as_mut() {
+                    s.meta_data.push(meta_data(&attrs));
+                }
+            }
+            ("service", "intent-filter") if is_start => filter = Some(IntentFilter::default()),
             ("application", "meta-data") => manifest.application.meta_data.push(meta_data(&attrs)),
-            ("application", "provider") if is_start => {
-                provider = Some(Provider {
+            ("application", "provider") => {
+                let built = Provider {
                     name: named(&attrs),
                     authorities: get(&attrs, "authorities").map(str::to_owned),
                     exported: flag(&attrs, "exported"),
@@ -363,16 +532,22 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     multiprocess: flag(&attrs, "multiprocess"),
                     process: get(&attrs, "process").map(str::to_owned),
                     grant_uri_permissions: flag(&attrs, "grantUriPermissions"),
+                    tools_node: get(&attrs, "node").map(str::to_owned),
                     meta_data: Vec::new(),
-                });
+                };
+                if is_start {
+                    provider = Some(built);
+                } else {
+                    manifest.application.provider.push(built);
+                }
             }
             ("provider", "meta-data") => {
                 if let Some(p) = provider.as_mut() {
                     p.meta_data.push(meta_data(&attrs));
                 }
             }
-            ("application", "receiver") if is_start => {
-                receiver = Some(Receiver {
+            ("application", "receiver") => {
+                let built = Receiver {
                     name: named(&attrs),
                     exported: flag(&attrs, "exported"),
                     enabled: flag(&attrs, "enabled"),
@@ -380,9 +555,15 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     label: get(&attrs, "label").map(str::to_owned),
                     icon: get(&attrs, "icon").map(str::to_owned),
                     direct_boot_aware: flag(&attrs, "directBootAware"),
+                    tools_node: get(&attrs, "node").map(str::to_owned),
                     meta_data: Vec::new(),
                     intent_filter: Vec::new(),
-                });
+                };
+                if is_start {
+                    receiver = Some(built);
+                } else {
+                    manifest.application.receiver.push(built);
+                }
             }
             ("receiver", "meta-data") => {
                 if let Some(r) = receiver.as_mut() {
@@ -410,6 +591,12 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
         }
     }
 
+    if let Some(a) = activity.take() {
+        manifest.application.activity.push(a);
+    }
+    if let Some(sv) = service.take() {
+        manifest.application.service.push(sv);
+    }
     if let Some(p) = provider.take() {
         manifest.application.provider.push(p);
     }
@@ -561,6 +748,12 @@ pub struct Activity {
     #[serde(rename(serialize = "@android:name"))]
     #[serde(default = "default_activity_name")]
     pub name: String,
+    /// `tools:node` from a library manifest. It steers merging and is never
+    /// written out: a merger directive has no meaning to the platform, and the
+    /// root element declares no `tools` namespace, so emitting it would make
+    /// the manifest unparseable.
+    #[serde(skip_serializing)]
+    pub tools_node: Option<String>,
     #[serde(
         rename(serialize = "@android:screenOrientation"),
         skip_serializing_if = "Option::is_none"
@@ -602,6 +795,7 @@ impl Default for Activity {
             exported: None,
             resizeable_activity: None,
             always_retain_task_state: None,
+            tools_node: None,
             meta_data: Default::default(),
             intent_filter: Default::default(),
         }
@@ -613,6 +807,12 @@ impl Default for Activity {
 pub struct Service {
     #[serde(rename(serialize = "@android:name"))]
     pub name: String,
+    /// `tools:node` from a library manifest. It steers merging and is never
+    /// written out: a merger directive has no meaning to the platform, and the
+    /// root element declares no `tools` namespace, so emitting it would make
+    /// the manifest unparseable.
+    #[serde(skip_serializing)]
+    pub tools_node: Option<String>,
     #[serde(
         rename(serialize = "@android:exported"),
         skip_serializing_if = "Option::is_none"
@@ -684,6 +884,12 @@ where
 pub struct Receiver {
     #[serde(rename(serialize = "@android:name"))]
     pub name: String,
+    /// `tools:node` from a library manifest. It steers merging and is never
+    /// written out: a merger directive has no meaning to the platform, and the
+    /// root element declares no `tools` namespace, so emitting it would make
+    /// the manifest unparseable.
+    #[serde(skip_serializing)]
+    pub tools_node: Option<String>,
     #[serde(
         rename(serialize = "@android:exported"),
         skip_serializing_if = "Option::is_none"
@@ -948,6 +1154,13 @@ pub struct Permission {
     pub max_sdk_version: Option<u32>,
 }
 
+/// Android [grant-uri-permission element](https://developer.android.com/guide/topics/manifest/grant-uri-permission-element).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct GrantUriPermission {
+    #[serde(rename(serialize = "@android:name"))]
+    pub uri: String,
+}
+
 /// Android [package element](https://developer.android.com/guide/topics/manifest/queries-element#package).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Package {
@@ -976,6 +1189,12 @@ pub struct QueryProvider {
 pub struct Provider {
     #[serde(rename(serialize = "@android:name"))]
     pub name: String,
+    /// `tools:node` from a library manifest. It steers merging and is never
+    /// written out: a merger directive has no meaning to the platform, and the
+    /// root element declares no `tools` namespace, so emitting it would make
+    /// the manifest unparseable.
+    #[serde(skip_serializing)]
+    pub tools_node: Option<String>,
     #[serde(
         rename(serialize = "@android:authorities"),
         skip_serializing_if = "Option::is_none"
@@ -1114,5 +1333,164 @@ mod tests {
             r#"<meta-data android:name="android.app.lib_name" android:value="example"/>"#
         ));
         assert!(!xml.contains("android:resource"));
+    }
+}
+
+#[cfg(test)]
+mod library_manifest_tests {
+    use super::*;
+
+    /// A library manifest exercising every element kind the merger reads, in
+    /// both the self-closing and the container form.
+    const LIBRARY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools" package="androidx.lib">
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <uses-feature android:name="android.hardware.vulkan.version" android:version="0x400003" />
+  <grant-uri-permission android:name="content://media" />
+  <application>
+    <service
+        android:name="androidx.lib.AlarmService"
+        android:exported="false"
+        android:enabled="@bool/alarm_default" />
+    <service android:name="androidx.lib.JobService" android:exported="true" />
+    <activity android:name=".Main" android:exported="true" />
+    <receiver android:name=".Boot" android:exported="true" />
+    <provider
+        android:name="androidx.lib.Init"
+        android:authorities="${applicationId}.lib"
+        android:exported="false"
+        tools:node="merge">
+      <meta-data android:name="androidx.lib.Init" android:value="androidx.startup" />
+    </provider>
+    <service android:name="androidx.lib.Dropped" tools:node="remove" />
+    <meta-data android:name="androidx.lib.meta" android:value="v" />
+  </application>
+</manifest>"#;
+
+    fn merged() -> AndroidManifest {
+        let library = parse_library_manifest(LIBRARY).expect("library parses");
+        let mut app = AndroidManifest {
+            package: "com.example.app".into(),
+            ..Default::default()
+        };
+        app.merge_library(&library, "com.example.app");
+        app
+    }
+
+    #[test]
+    fn self_closing_and_container_components_are_both_read() {
+        let app = merged();
+        // Self-closing `<service ... />` used to be skipped entirely.
+        let services: Vec<&str> = app
+            .application
+            .service
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            services.contains(&"androidx.lib.AlarmService"),
+            "{services:?}"
+        );
+        assert!(
+            services.contains(&"androidx.lib.JobService"),
+            "{services:?}"
+        );
+        assert_eq!(app.application.receiver.len(), 1);
+        assert_eq!(app.application.activity.len(), 2); // library's + the default
+    }
+
+    #[test]
+    fn features_and_grant_uri_permissions_are_merged() {
+        let app = merged();
+        assert_eq!(app.uses_feature.len(), 1);
+        assert_eq!(
+            app.uses_feature[0].name.as_deref(),
+            Some("android.hardware.vulkan.version")
+        );
+        assert_eq!(app.grant_uri_permission.len(), 1);
+        assert_eq!(app.grant_uri_permission[0].uri, "content://media");
+    }
+
+    #[test]
+    fn application_id_is_substituted_in_authorities() {
+        let app = merged();
+        assert_eq!(
+            app.application.provider[0].authorities.as_deref(),
+            Some("com.example.app.lib")
+        );
+    }
+
+    #[test]
+    fn tools_node_remove_drops_the_element() {
+        let app = merged();
+        assert!(
+            !app.application
+                .service
+                .iter()
+                .any(|s| s.name == "androidx.lib.Dropped"),
+            "tools:node=\"remove\" must drop the library's declaration"
+        );
+    }
+
+    #[test]
+    fn tools_directives_never_reach_the_output_manifest() {
+        let app = merged();
+        let dir = std::env::temp_dir().join("cargo-rapk-tools-node-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        app.write_to(&dir).unwrap();
+        let xml = std::fs::read_to_string(dir.join("AndroidManifest.xml")).unwrap();
+        // A `tools:` attribute would need a namespace the root does not
+        // declare, making the manifest unparseable by aapt2.
+        assert!(
+            !xml.contains("tools:"),
+            "tools: leaked into the manifest: {xml}"
+        );
+    }
+
+    #[test]
+    fn the_app_declaration_wins_unless_the_library_says_replace() {
+        let library = parse_library_manifest(
+            r#"<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="l">
+                 <application>
+                   <service android:name="S" android:exported="false" />
+                   <service android:name="R" android:exported="false" tools:node="replace" />
+                 </application>
+               </manifest>"#,
+        )
+        .unwrap();
+        let mut app = AndroidManifest {
+            package: "com.example.app".into(),
+            ..Default::default()
+        };
+        app.application.service.push(Service {
+            name: "S".into(),
+            exported: Some(true),
+            ..Default::default()
+        });
+        app.application.service.push(Service {
+            name: "R".into(),
+            exported: Some(true),
+            ..Default::default()
+        });
+        app.merge_library(&library, "com.example.app");
+        let s = app
+            .application
+            .service
+            .iter()
+            .find(|s| s.name == "S")
+            .unwrap();
+        let r = app
+            .application
+            .service
+            .iter()
+            .find(|s| s.name == "R")
+            .unwrap();
+        assert_eq!(s.exported, Some(true), "the app's own declaration must win");
+        assert_eq!(
+            r.exported,
+            Some(false),
+            "tools:node=\"replace\" must override"
+        );
     }
 }

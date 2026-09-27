@@ -128,11 +128,57 @@ pub enum Requirement {
     Release,
 }
 
+impl fmt::Display for Bound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unbounded => Ok(()),
+            Self::Inclusive(version) | Self::Exclusive(version) => write!(f, "{version}"),
+        }
+    }
+}
+
+impl fmt::Display for Restriction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (Bound::Inclusive(low), Bound::Inclusive(high)) = (&self.lower, &self.upper)
+            && low == high
+        {
+            // Maven writes a single pinned version as `[1.0]`, not `[1.0,1.0]`.
+            return write!(f, "[{low}]");
+        }
+        let open = if matches!(self.lower, Bound::Exclusive(_)) {
+            "("
+        } else {
+            "["
+        };
+        let close = if matches!(self.upper, Bound::Exclusive(_)) {
+            ")"
+        } else {
+            "]"
+        };
+        match &self.upper {
+            Bound::Unbounded => write!(f, "{open}{}", self.lower),
+            upper => write!(f, "{open}{},{upper}{close}", self.lower),
+        }
+    }
+}
+
+impl fmt::Display for VersionRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, restriction) in self.restrictions.iter().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{restriction}")?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for Requirement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Exact(version) | Self::Soft(version) => f.write_str(version.as_str()),
-            Self::Range(range) => f.write_str(&format!("{range:?}")),
+            Self::Range(range) => write!(f, "{range}"),
             Self::Latest => f.write_str("LATEST"),
             Self::Release => f.write_str("RELEASE"),
         }
