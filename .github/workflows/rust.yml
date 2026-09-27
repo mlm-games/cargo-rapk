@@ -145,13 +145,14 @@ jobs:
         # outcome: without this check a dead emulator is reported as a missing
         # `~/logcat.log`, which says nothing about why.
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 30
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: ${{ env.api-level }}
           arch: ${{ env.arch }}
           target: ${{ env.target }}
           profile: ${{ env.profile }}
+          emulator-boot-timeout: 1200
           emulator-options: -no-snapshot-save ${{ env.emulator-options }}
           disable-animations: true
           force-avd-creation: false
