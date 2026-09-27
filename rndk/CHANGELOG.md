@@ -1,3 +1,16 @@
+# 0.25.0 (2026-09-27)
+
+- **Breaking:** Add transitive Maven resolution for `android_libs`, following POMs and Gradle Module Metadata, with newest-wins mediation and a warning when the selected version falls outside a hard range. Add the `pom`, `gmm`, `range` and `version` modules, and `maven::{ensure_lib, Coordinates, ResolvedLib}`.
+- **Breaking:** Add `AndroidManifest::{permission, grant_uri_permission}`, `tools_node` on `Activity`, `Service`, `Receiver` and `Provider`, and `enabled` on `Activity` and `Service`. `Receiver::enabled` and `Provider::enabled` widen from `Option<bool>` to `Option<Enabled>`. Downstream struct literals of these public types need updating.
+- **Breaking:** Read a library's `AndroidManifest.xml` with an event parser, `manifest::parse_library_manifest`, rather than the `quick-xml` deserializer, which cannot read the `android:`-prefixed attributes these types are declared with. `merge_library` now has components to merge.
+- **Breaking:** Build the APK with `aapt2` instead of `aapt` v1, so `resources.arsc` differs from any earlier build.
+- Add `Enabled`, which keeps a resource reference in `android:enabled` instead of collapsing it to a boolean, with serialization as a plain attribute value and deserialization from either a boolean or a string.
+- Read library `activity`, `service`, `uses-feature` (including `android:glEsVersion`) and `grant-uri-permission` elements, honour `tools:node` on every component, and read self-closing components, which were skipped.
+- Read a cached library manifest from its archive rather than a line-encoded sidecar file, which truncated it at the first newline and so recovered nothing.
+- Extract a library's `res/` to the path under `res/` rather than a nested `res/res/`, which left the tree `aapt2` compiles empty.
+- Render a version range in Maven syntax rather than a Rust debug dump, so a range in a diagnostic reads `[1.0]` and not a struct literal.
+- Verify a downloaded POM and Gradle Module Metadata against their `.sha1` sidecar, as an artifact already was, and fail closed when it is absent.
+
 # 0.24.0 (2026-09-27)
 
 - Link libraries with 16KiB alignment for NDK versions older than r28, so that APKs remain loadable on Android 15+ devices that run with 16KiB pages. ([#76](https://github.com/rust-mobile/cargo-apk/pull/76))

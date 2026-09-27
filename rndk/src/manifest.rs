@@ -1,5 +1,6 @@
 use crate::error::NdkError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 use std::path::Path;
 
 /// Android [manifest element](https://developer.android.com/guide/topics/manifest/manifest-element), containing an [`Application`] element.
@@ -335,6 +336,10 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
         get(attrs, name).and_then(|v| v.parse().ok())
     }
 
+    fn enabled(attrs: &[(String, String)]) -> Option<Enabled> {
+        get(attrs, "enabled").map(Enabled::parse)
+    }
+
     fn number(attrs: &[(String, String)], name: &str) -> Option<u32> {
         get(attrs, name).and_then(|v| v.parse().ok())
     }
@@ -406,12 +411,28 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     }
                     Some("intent-filter") | Some("intent") => {
                         if let Some(done) = filter.take() {
-                            if owner == "queries"
-                                && let Some(queries) = queries.as_mut()
-                            {
-                                queries.intent.push(done);
-                            } else if let Some(receiver) = receiver.as_mut() {
-                                receiver.intent_filter.push(done);
+                            match owner {
+                                "queries" => {
+                                    if let Some(queries) = queries.as_mut() {
+                                        queries.intent.push(done);
+                                    }
+                                }
+                                "receiver" => {
+                                    if let Some(receiver) = receiver.as_mut() {
+                                        receiver.intent_filter.push(done);
+                                    }
+                                }
+                                "activity" => {
+                                    if let Some(activity) = activity.as_mut() {
+                                        activity.intent_filter.push(done);
+                                    }
+                                }
+                                "service" => {
+                                    if let Some(service) = service.as_mut() {
+                                        service.intent_filter.push(done);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -457,12 +478,13 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     });
                 }
             }
-            ("queries", "intent") if is_start => filter = Some(IntentFilter::default()),
             ("manifest", "uses-feature") => manifest.uses_feature.push(Feature {
                 name: get(&attrs, "name").map(str::to_owned),
                 required: flag(&attrs, "required"),
                 version: number(&attrs, "version"),
-                opengles_version: None,
+                opengles_version: get(&attrs, "glEsVersion")
+                    .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                    .map(|v| ((v >> 16) as u8, v as u8)),
             }),
             ("manifest", "grant-uri-permission") => manifest
                 .grant_uri_permission
@@ -475,6 +497,7 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     launch_mode: get(&attrs, "launchMode").map(str::to_owned),
                     orientation: get(&attrs, "screenOrientation").map(str::to_owned),
                     exported: flag(&attrs, "exported"),
+                    enabled: enabled(&attrs),
                     resizeable_activity: flag(&attrs, "resizeableActivity"),
                     always_retain_task_state: flag(&attrs, "alwaysRetainTaskState"),
                     tools_node: get(&attrs, "node").map(str::to_owned),
@@ -497,6 +520,7 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                 let built = Service {
                     name: named(&attrs),
                     exported: flag(&attrs, "exported"),
+                    enabled: enabled(&attrs),
                     foreground_service_type: get(&attrs, "foregroundServiceType")
                         .map(str::to_owned),
                     label: get(&attrs, "label").map(str::to_owned),
@@ -527,7 +551,7 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     name: named(&attrs),
                     authorities: get(&attrs, "authorities").map(str::to_owned),
                     exported: flag(&attrs, "exported"),
-                    enabled: flag(&attrs, "enabled"),
+                    enabled: enabled(&attrs),
                     init_order: get(&attrs, "initOrder").and_then(|v| v.parse().ok()),
                     multiprocess: flag(&attrs, "multiprocess"),
                     process: get(&attrs, "process").map(str::to_owned),
@@ -550,7 +574,7 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                 let built = Receiver {
                     name: named(&attrs),
                     exported: flag(&attrs, "exported"),
-                    enabled: flag(&attrs, "enabled"),
+                    enabled: enabled(&attrs),
                     permission: get(&attrs, "permission").map(str::to_owned),
                     label: get(&attrs, "label").map(str::to_owned),
                     icon: get(&attrs, "icon").map(str::to_owned),
@@ -765,6 +789,11 @@ pub struct Activity {
     )]
     pub exported: Option<bool>,
     #[serde(
+        rename(serialize = "@android:enabled"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<Enabled>,
+    #[serde(
         rename(serialize = "@android:resizeableActivity"),
         skip_serializing_if = "Option::is_none"
     )]
@@ -793,6 +822,7 @@ impl Default for Activity {
             name: default_activity_name(),
             orientation: None,
             exported: None,
+            enabled: None,
             resizeable_activity: None,
             always_retain_task_state: None,
             tools_node: None,
@@ -818,6 +848,11 @@ pub struct Service {
         skip_serializing_if = "Option::is_none"
     )]
     pub exported: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:enabled"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<Enabled>,
     #[serde(
         rename(serialize = "@android:foregroundServiceType"),
         skip_serializing_if = "Option::is_none"
@@ -879,6 +914,58 @@ where
     }
 }
 
+/// `android:enabled` is a plain boolean in the app's own config, but a library
+/// routinely gates a component on an API-dependent default, as
+/// `androidx.work` does with `android:enabled="@bool/enable_system_alarm_service_default"`.
+/// Collapsing that to a boolean would ship the component enabled when the
+/// library meant it disabled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Enabled {
+    Always(bool),
+    WhenResource(String),
+}
+
+impl Enabled {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "true" => Self::Always(true),
+            "false" => Self::Always(false),
+            reference => Self::WhenResource(reference.to_owned()),
+        }
+    }
+}
+
+impl Serialize for Enabled {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl fmt::Display for Enabled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Always(true) => f.write_str("true"),
+            Self::Always(false) => f.write_str("false"),
+            Self::WhenResource(reference) => f.write_str(reference),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Enabled {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Reference(String),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Flag(flag) => Self::Always(flag),
+            Raw::Reference(reference) => Self::parse(&reference),
+        })
+    }
+}
+
 /// Android [receiver element](https://developer.android.com/guide/topics/manifest/receiver-element).
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct Receiver {
@@ -899,7 +986,7 @@ pub struct Receiver {
         rename(serialize = "@android:enabled"),
         skip_serializing_if = "Option::is_none"
     )]
-    pub enabled: Option<bool>,
+    pub enabled: Option<Enabled>,
     #[serde(
         rename(serialize = "@android:permission"),
         skip_serializing_if = "Option::is_none"
@@ -1209,7 +1296,7 @@ pub struct Provider {
         rename(serialize = "@android:enabled"),
         skip_serializing_if = "Option::is_none"
     )]
-    pub enabled: Option<bool>,
+    pub enabled: Option<Enabled>,
     #[serde(
         rename(serialize = "@android:initOrder"),
         skip_serializing_if = "Option::is_none"
@@ -1430,6 +1517,118 @@ mod library_manifest_tests {
                 .iter()
                 .any(|s| s.name == "androidx.lib.Dropped"),
             "tools:node=\"remove\" must drop the library's declaration"
+        );
+    }
+
+    #[test]
+    fn an_intent_filter_reaches_the_component_that_owns_it() {
+        // An activity or service filter used to be dropped, or worse filed
+        // under whichever receiver happened to be open.
+        let library = parse_library_manifest(
+            r#"<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="l">
+                 <application>
+                   <activity android:name=".A" android:exported="true">
+                     <intent-filter>
+                       <action android:name="android.intent.action.MAIN" />
+                       <category android:name="android.intent.category.LAUNCHER" />
+                     </intent-filter>
+                   </activity>
+                   <service android:name="S">
+                     <intent-filter><action android:name="x" /></intent-filter>
+                   </service>
+                   <receiver android:name="R" />
+                 </application>
+               </manifest>"#,
+        )
+        .unwrap();
+        let mut app = AndroidManifest::default();
+        app.merge_library(&library, "com.example.app");
+        let activity = app
+            .application
+            .activity
+            .iter()
+            .find(|a| a.name == ".A")
+            .unwrap();
+        assert_eq!(activity.intent_filter.len(), 1);
+        assert_eq!(
+            activity.intent_filter[0].actions,
+            vec!["android.intent.action.MAIN".to_owned()]
+        );
+        assert_eq!(
+            activity.intent_filter[0].categories,
+            vec!["android.intent.category.LAUNCHER".to_owned()]
+        );
+        let service = app
+            .application
+            .service
+            .iter()
+            .find(|s| s.name == "S")
+            .unwrap();
+        assert_eq!(service.intent_filter.len(), 1);
+        let receiver = app
+            .application
+            .receiver
+            .iter()
+            .find(|r| r.name == "R")
+            .unwrap();
+        assert!(
+            receiver.intent_filter.is_empty(),
+            "a filter must not be filed under the wrong component"
+        );
+    }
+
+    #[test]
+    fn gl_es_version_is_read_from_its_hexadecimal_attribute() {
+        let app = parse_library_manifest(
+            r#"<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="l">
+                 <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+               </manifest>"#,
+        )
+        .unwrap();
+        assert_eq!(app.uses_feature[0].opengles_version, Some((3, 0)));
+        assert_eq!(app.uses_feature[0].required, Some(true));
+    }
+
+    #[test]
+    fn enabled_keeps_a_resource_reference_rather_than_collapsing_it() {
+        // `androidx.work` gates its services on a library-owned default.
+        // Reading it as a bool and dropping the attribute would ship the
+        // service enabled when the library meant it disabled.
+        let app = merged();
+        let alarm = app
+            .application
+            .service
+            .iter()
+            .find(|s| s.name.ends_with("AlarmService"))
+            .expect("the library's service merged");
+        assert_eq!(
+            alarm.enabled,
+            Some(Enabled::WhenResource("@bool/alarm_default".into()))
+        );
+    }
+
+    #[test]
+    fn enabled_serializes_as_a_plain_attribute_value() {
+        assert_eq!(Enabled::Always(true).to_string(), "true");
+        assert_eq!(Enabled::Always(false).to_string(), "false");
+        assert_eq!(
+            Enabled::WhenResource("@bool/x".into()).to_string(),
+            "@bool/x"
+        );
+    }
+
+    #[test]
+    fn enabled_reads_a_plain_boolean_from_the_app_own_config() {
+        #[derive(Deserialize)]
+        struct Holder {
+            enabled: Option<Enabled>,
+        }
+        let from_bool: Holder = toml::from_str("enabled = true").unwrap();
+        assert_eq!(from_bool.enabled, Some(Enabled::Always(true)));
+        let from_string: Holder = toml::from_str(r#"enabled = "@bool/x""#).unwrap();
+        assert_eq!(
+            from_string.enabled,
+            Some(Enabled::WhenResource("@bool/x".into()))
         );
     }
 

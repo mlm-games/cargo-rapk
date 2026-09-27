@@ -1,3 +1,14 @@
+# 0.25.0 (2026-09-28)
+
+- **Breaking:** Resolve `android_libs` transitively. A list that named every artifact by hand now resolves its own closure, following POMs and Gradle Module Metadata, so `androidx.appcompat:appcompat:1.7.0` alone pulls 43 artifacts. Where two paths want different versions of one artifact the newest wins whatever its distance from the root, matching Gradle. A hand-written list therefore resolves to a different, larger set than it did before, and an explicit pin can be superseded by a newer transitive request; declare the version you want and check the build's resolved list. A hard range `[x,y]` that the winner cannot satisfy is reported as a warning rather than failing the build.
+- **Breaking:** Build the APK with `aapt2` instead of `aapt` v1. `resources.arsc` differs from any build made before this change, so a reference APK produced by an older release will not match a rebuild of the same source; rebuild reference APKs when upgrading. Inputs `aapt` v1 accepted, such as an overlay-only resource, are now rejected.
+- **Breaking:** Merge library manifests for real. They previously were parsed into nothing, so an APK built with `android_libs` shipped without anything the library declared. It now carries the library's `uses-permission`, `permission`, `uses-feature`, `grant-uri-permission`, `meta-data`, and its `activity`, `service`, `receiver` and `provider` with their intent filters, with `${applicationId}` substituted. A library component whose `tools:node` is `remove` is dropped and one marked `replace` overrides the app's declaration; otherwise the app's own declaration wins. Apps that previously shipped with these declarations missing will now declare them, which can surface a `SecurityException` or a missing-component failure that the gap was hiding.
+- **Breaking:** `android:enabled` keeps a resource reference such as `@bool/enable_system_alarm_service_default` instead of dropping it, so a component a library gates on an API-dependent default is no longer shipped enabled. `aapt2` now fails the build if such a reference does not resolve, where the attribute used to be discarded.
+- `queries.provider.name` is optional, as the specification has it; it was only required while the APK path ran `aapt` v1.
+- Fix library `res/` being extracted to a nested `res/res/` and so compiled as an empty tree, which left every library resource out of `resources.arsc` and every generated `R` class empty.
+- Read self-closing components such as `<service ... />`, which were skipped; `androidx.work` declares its services that way, and they were dropped along with its receivers, so WorkManager jobs could never run.
+- Do not write a `tools:` attribute into the merged manifest, which has no `tools` namespace declared and so could not be parsed by `aapt2`.
+
 # 0.24.0 (2026-09-27)
 
 - **Breaking:** Default `target_sdk_version` to `35` (if installed), matching Google Play requirements starting August 31 2025.
