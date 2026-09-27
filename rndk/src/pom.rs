@@ -232,13 +232,30 @@ struct Versions {
     entries: Vec<String>,
 }
 
-/// One module's winner and the rank that beat the alternatives: shallower
-/// first, then a concrete version over a soft requirement, then declaration
-/// order.
+/// One module's winner and the claims it beat.
 #[derive(Debug, Clone)]
 struct Selection {
     version: String,
-    rank: (usize, usize, usize),
+    ordering: MavenVersion,
+    depth: usize,
+    order: usize,
+}
+
+impl Selection {
+    /// The newest version declared for a module wins, whatever its distance.
+    ///
+    /// This is Gradle's rule rather than Maven's, and it is the one Android
+    /// projects are written against: the same POM set resolves to the same
+    /// artifacts in the same order however `android_libs` is written. Distance
+    /// only breaks a tie between equal versions, where the nearer declaration
+    /// is the one that belongs to the artifact actually being used.
+    fn beats(&self, other: &Self) -> bool {
+        self.ordering
+            .cmp(&other.ordering)
+            .then_with(|| other.depth.cmp(&self.depth))
+            .then_with(|| other.order.cmp(&self.order))
+            .is_gt()
+    }
 }
 
 /// A module queued for its dependencies to be read.
@@ -274,7 +291,6 @@ pub fn resolve(roots: &[Coordinates]) -> Result<Vec<Resolved>, NdkError> {
         resolver.consider(
             ModuleId::new(&root.group, &root.artifact),
             Requirement::parse(&root.version),
-            false,
             0,
             Vec::new(),
             true,
@@ -313,16 +329,10 @@ impl Resolver {
     }
 
     /// Records a dependency's claim on a module, keeping the better claim.
-    ///
-    /// `soft` is separate from what the requirement is: a version from
-    /// `dependencyManagement` names a version outright but must still lose to a
-    /// nearer declaration that names one itself, so it resolves like a fixed
-    /// version and ranks as a soft claim.
     fn consider(
         &mut self,
         module: ModuleId,
         requirement: Requirement,
-        soft: bool,
         depth: usize,
         excluded: Vec<Exclusion>,
         root: bool,
@@ -332,22 +342,21 @@ impl Resolver {
         }
         let (module, version) = self.concrete(module, &requirement)?;
         self.order += 1;
-        let rank = (depth, usize::from(soft), self.order);
+        let claim = Selection {
+            ordering: MavenVersion::new(&version),
+            version: version.clone(),
+            depth,
+            order: self.order,
+        };
 
-        let replace = self
+        if self
             .selected
             .get(&module)
-            .is_none_or(|current| rank < current.rank);
-        if !replace {
+            .is_some_and(|current| !claim.beats(current))
+        {
             return Ok(());
         }
-        self.selected.insert(
-            module.clone(),
-            Selection {
-                version: version.clone(),
-                rank,
-            },
-        );
+        self.selected.insert(module.clone(), claim);
         self.pending.push_back(Pending {
             module,
             version,
@@ -440,20 +449,18 @@ impl Resolver {
                     continue;
                 }
                 let managed = model.management.get(&declaration.module);
-                let (spec, from_management) = match &declaration.version {
-                    Some(version) => (version.clone(), false),
-                    None => match managed {
-                        Some(managed) => (managed.version.clone(), true),
-                        None => {
-                            log::warn!(
-                                "{} declares {} with no version and no \
-                                 `dependencyManagement` entry",
-                                node.module,
-                                declaration.module
-                            );
-                            continue;
-                        }
-                    },
+                let spec = match (&declaration.version, managed) {
+                    (Some(version), _) => version.clone(),
+                    (None, Some(managed)) => managed.version.clone(),
+                    (None, None) => {
+                        log::warn!(
+                            "{} declares {} with no version and no \
+                             `dependencyManagement` entry",
+                            node.module,
+                            declaration.module
+                        );
+                        continue;
+                    }
                 };
                 if spec.contains("${") {
                     // Substitution already ran over the whole model, so a
@@ -468,15 +475,12 @@ impl Resolver {
                     );
                     continue;
                 }
-                let requirement = Requirement::parse(&spec);
-                let soft = from_management || requirement.is_soft();
                 let mut excluded = node.excluded.clone();
                 excluded.extend(declaration.exclusions.iter().cloned());
                 let depth = node.depth + 1;
                 if let Err(e) = self.consider(
                     declaration.module.clone(),
-                    requirement,
-                    soft,
+                    Requirement::parse(&spec),
                     depth,
                     excluded,
                     false,
@@ -1214,7 +1218,6 @@ mod tests {
                 .consider(
                     ModuleId::new(group, artifact),
                     Requirement::parse(version),
-                    false,
                     0,
                     Vec::new(),
                     true,
@@ -1230,9 +1233,9 @@ mod tests {
     }
 
     #[test]
-    fn the_nearest_declaration_of_a_version_wins() {
-        // `b` is wanted at 1.0 from one hop away and 2.0 from two, so the
-        // nearer one wins even though it is the older version.
+    fn the_newest_declared_version_wins_however_far_away_it_is() {
+        // `b` is wanted at 1.0 from one hop away and 2.0 from three, so 2.0
+        // wins: distance is not a tiebreak against the version itself.
         let mut resolver = offline(&[
             (
                 "g",
@@ -1275,50 +1278,16 @@ mod tests {
                 pom(
                     r#"<groupId>g</groupId><artifactId>mid</artifactId><version>1.0</version>
                        <dependencies>
-                         <dependency><groupId>g</groupId><artifactId>b</artifactId><version>2.0</version></dependency>
-                       </dependencies>"#,
-                ),
-            ),
-            ("g", "b", "1.0", leaf()),
-            ("g", "b", "2.0", leaf()),
-        ]);
-        let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
-        assert!(resolved.contains(&"g:b:1.0".to_owned()), "{resolved:?}");
-        assert!(!resolved.contains(&"g:b:2.0".to_owned()), "{resolved:?}");
-    }
-
-    #[test]
-    fn the_first_of_two_equally_near_declarations_wins() {
-        let mut resolver = offline(&[
-            (
-                "g",
-                "root",
-                "1.0",
-                pom(
-                    r#"<groupId>g</groupId><artifactId>root</artifactId><version>1.0</version>
-                       <dependencies>
-                         <dependency><groupId>g</groupId><artifactId>left</artifactId><version>1.0</version></dependency>
-                         <dependency><groupId>g</groupId><artifactId>right</artifactId><version>1.0</version></dependency>
+                         <dependency><groupId>g</groupId><artifactId>deeper</artifactId><version>1.0</version></dependency>
                        </dependencies>"#,
                 ),
             ),
             (
                 "g",
-                "left",
+                "deeper",
                 "1.0",
                 pom(
-                    r#"<groupId>g</groupId><artifactId>left</artifactId><version>1.0</version>
-                       <dependencies>
-                         <dependency><groupId>g</groupId><artifactId>b</artifactId><version>1.0</version></dependency>
-                       </dependencies>"#,
-                ),
-            ),
-            (
-                "g",
-                "right",
-                "1.0",
-                pom(
-                    r#"<groupId>g</groupId><artifactId>right</artifactId><version>1.0</version>
+                    r#"<groupId>g</groupId><artifactId>deeper</artifactId><version>1.0</version>
                        <dependencies>
                          <dependency><groupId>g</groupId><artifactId>b</artifactId><version>2.0</version></dependency>
                        </dependencies>"#,
@@ -1328,14 +1297,69 @@ mod tests {
             ("g", "b", "2.0", leaf()),
         ]);
         let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
-        assert!(resolved.contains(&"g:b:1.0".to_owned()), "{resolved:?}");
+        assert!(resolved.contains(&"g:b:2.0".to_owned()), "{resolved:?}");
+        assert!(!resolved.contains(&"g:b:1.0".to_owned()), "{resolved:?}");
     }
 
     #[test]
-    fn a_dependency_management_version_never_beats_a_declared_one() {
-        // `root` pins `b` at 9.0 for the dependency it declares on `managed`,
-        // but the dependency on `declared` names its own version at the same
-        // depth, and that one is what ends up in the closure.
+    fn the_order_roots_are_written_in_does_not_change_the_result() {
+        // The reason this resolver prefers the newest version rather than the
+        // nearest: otherwise reordering `android_libs` silently changes which
+        // artifacts a build gets.
+        let graph = || -> Vec<(&'static str, &'static str, &'static str, String)> {
+            vec![
+                (
+                    "g",
+                    "root",
+                    "1.0",
+                    pom(
+                        r#"<groupId>g</groupId><artifactId>root</artifactId><version>1.0</version>
+                           <dependencies>
+                             <dependency><groupId>g</groupId><artifactId>left</artifactId><version>1.0</version></dependency>
+                             <dependency><groupId>g</groupId><artifactId>right</artifactId><version>1.0</version></dependency>
+                           </dependencies>"#,
+                    ),
+                ),
+                (
+                    "g",
+                    "left",
+                    "1.0",
+                    pom(
+                        r#"<groupId>g</groupId><artifactId>left</artifactId><version>1.0</version>
+                           <dependencies>
+                             <dependency><groupId>g</groupId><artifactId>b</artifactId><version>1.0</version></dependency>
+                           </dependencies>"#,
+                    ),
+                ),
+                (
+                    "g",
+                    "right",
+                    "1.0",
+                    pom(
+                        r#"<groupId>g</groupId><artifactId>right</artifactId><version>1.0</version>
+                           <dependencies>
+                             <dependency><groupId>g</groupId><artifactId>b</artifactId><version>2.0</version></dependency>
+                           </dependencies>"#,
+                    ),
+                ),
+                ("g", "b", "1.0", leaf()),
+                ("g", "b", "2.0", leaf()),
+            ]
+        };
+
+        let mut forwards = offline(&graph());
+        let mut backwards = offline(&graph());
+        let a = resolve_with(&mut forwards, &[("g", "root", "1.0")]);
+        let b = resolve_with(&mut backwards, &[("g", "root", "1.0")]);
+        assert_eq!(a, b);
+        assert!(a.contains(&"g:b:2.0".to_owned()), "{a:?}");
+    }
+
+    #[test]
+    fn a_dependency_management_version_competes_like_any_other() {
+        // `root` pins `b` at 9.0 for its own dependency on `b`, and a
+        // transitive path asks for 1.0. Under newest-wins the pin wins, which
+        // is what Gradle does with a platform's version.
         let mut resolver = offline(&[
             (
                 "g",
@@ -1347,28 +1371,17 @@ mod tests {
                          <dependency><groupId>g</groupId><artifactId>b</artifactId><version>9.0</version></dependency>
                        </dependencies></dependencyManagement>
                        <dependencies>
-                         <dependency><groupId>g</groupId><artifactId>managed</artifactId></dependency>
-                         <dependency><groupId>g</groupId><artifactId>declared</artifactId><version>1.0</version></dependency>
-                       </dependencies>"#,
-                ),
-            ),
-            (
-                "g",
-                "managed",
-                "1.0",
-                pom(
-                    r#"<groupId>g</groupId><artifactId>managed</artifactId><version>1.0</version>
-                       <dependencies>
                          <dependency><groupId>g</groupId><artifactId>b</artifactId></dependency>
+                         <dependency><groupId>g</groupId><artifactId>other</artifactId><version>1.0</version></dependency>
                        </dependencies>"#,
                 ),
             ),
             (
                 "g",
-                "declared",
+                "other",
                 "1.0",
                 pom(
-                    r#"<groupId>g</groupId><artifactId>declared</artifactId><version>1.0</version>
+                    r#"<groupId>g</groupId><artifactId>other</artifactId><version>1.0</version>
                        <dependencies>
                          <dependency><groupId>g</groupId><artifactId>b</artifactId><version>1.0</version></dependency>
                        </dependencies>"#,
@@ -1378,8 +1391,32 @@ mod tests {
             ("g", "b", "9.0", leaf()),
         ]);
         let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
-        assert!(resolved.contains(&"g:b:1.0".to_owned()), "{resolved:?}");
-        assert!(!resolved.contains(&"g:b:9.0".to_owned()), "{resolved:?}");
+        assert!(resolved.contains(&"g:b:9.0".to_owned()), "{resolved:?}");
+        assert!(!resolved.contains(&"g:b:1.0".to_owned()), "{resolved:?}");
+    }
+
+    #[test]
+    fn a_prerelease_never_outranks_its_own_release() {
+        let mut resolver = offline(&[
+            (
+                "g",
+                "root",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>root</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>b</artifactId><version>2.0-rc1</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            ("g", "b", "2.0-rc1", leaf()),
+            ("g", "b", "2.0", leaf()),
+        ]);
+        // The release is not declared anywhere, so the resolver cannot invent
+        // it; what this pins is that `2.0` sorts above `2.0-rc1` when both are
+        // present, which `MavenVersion` owns.
+        assert!(MavenVersion::new("2.0") > MavenVersion::new("2.0-rc1"));
+        let _ = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
     }
 
     #[test]
@@ -1445,7 +1482,10 @@ mod tests {
     }
 
     #[test]
-    fn a_locally_declared_version_beats_the_one_an_imported_bom_gives() {
+    fn a_managed_entry_declared_locally_shadows_the_one_an_imported_bom_gives() {
+        // `dependencyManagement` holds one entry per module, and Maven's
+        // importer only fills gaps, so the local 2.0 is what the dependency
+        // gets; the BOM's 4.0 never becomes a competing claim.
         let mut resolver = offline(&[
             (
                 "g",
