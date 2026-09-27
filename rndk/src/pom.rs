@@ -4,9 +4,15 @@
 //! that actually has to be on the classpath. It follows the parts of the Maven
 //! model that change *which* artifact gets picked: the parent chain,
 //! `dependencyManagement` including imported BOMs, exclusions and scopes.
-//! Version selection is Maven Resolver's: the nearest declaration wins, and a
-//! managed, ranged or `LATEST` version is a soft requirement that yields to a
-//! nearer dependency naming a version outright.
+//!
+//! When two paths want different versions of one module the newest wins, with
+//! distance only breaking a tie between equal versions. That is Gradle's rule
+//! rather than Maven's, and it is the one Android projects are written against:
+//! the same set of POMs resolves to the same artifacts however `android_libs`
+//! is written.
+//!
+//! A module that publishes [Gradle Module Metadata](crate::gmm) is read from
+//! that instead, as Gradle does, and the POM is only a fallback.
 
 use crate::error::NdkError;
 use crate::gmm;
@@ -275,11 +281,9 @@ struct Pending {
 
 /// How a declaration's version reached it.
 enum Claim {
-    /// Written in the declaration itself.
-    Declared,
-    /// Left out and filled in from `dependencyManagement` or a BOM.
+    /// Left out, and filled in from `dependencyManagement` or a BOM.
     Version(String),
-    /// Never written anywhere, which the resolver reports rather than guesses.
+    /// Written nowhere, which the resolver reports rather than guesses.
     Undeclared,
     /// A `dependencyConstraint`: advice about a version, not a request for the
     /// artifact. It competes for a module already in the graph and is otherwise
@@ -417,12 +421,13 @@ impl Resolver {
             module: module.clone(),
             version,
             depth,
-            excluded,
+            excluded: excluded.clone(),
             root,
         });
         if first_time && let Some(advised) = self.constrained.remove(&module) {
             let requirement = Requirement::parse(&advised);
             let (module, version) = self.concrete(module, &requirement)?;
+            self.order += 1;
             let claim = Selection {
                 ordering: MavenVersion::new(&version),
                 version: version.clone(),
@@ -439,8 +444,8 @@ impl Resolver {
                     module,
                     version,
                     depth,
-                    excluded: Vec::new(),
-                    root: false,
+                    excluded: excluded.clone(),
+                    root,
                 });
             }
         }
@@ -546,7 +551,7 @@ impl Resolver {
                     },
                     (Some(version), _) => (version.clone(), false),
                     (None, Claim::Version(version)) => (version, false),
-                    (None, Claim::Declared) | (None, Claim::Undeclared) => {
+                    (None, Claim::Undeclared) => {
                         log::warn!(
                             "{} declares {} with no version and no \
                              `dependencyManagement` entry",
@@ -621,12 +626,15 @@ impl Resolver {
             if platform {
                 continue;
             }
-            let packaging = if extension.is_some() {
-                "aar".to_owned()
-            } else {
-                self.models
+            // The metadata names the archive, so it also settles what this is
+            // packaged as; a POM's `<packaging>` only has to be believed when
+            // there is no metadata to ask.
+            let packaging = match &extension {
+                Some(extension) => extension.clone(),
+                None => self
+                    .models
                     .get(&coordinates)
-                    .map_or_else(|| "jar".to_owned(), |model| model.packaging.clone())
+                    .map_or_else(|| "jar".to_owned(), |model| model.packaging.clone()),
             };
             if packaging == "pom" {
                 continue;
@@ -647,8 +655,17 @@ impl Resolver {
         coordinates: &Coordinates,
     ) -> Result<Vec<(Declaration, Claim)>, NdkError> {
         if self.metadata(coordinates).is_some() {
-            return Ok(self.metadata_declarations(coordinates));
+            return self.metadata_declarations(coordinates);
         }
+        self.pom_declarations(coordinates)
+    }
+
+    /// What the POM declares, with `dependencyManagement` filling in any version
+    /// the document left out.
+    fn pom_declarations(
+        &mut self,
+        coordinates: &Coordinates,
+    ) -> Result<Vec<(Declaration, Claim)>, NdkError> {
         let module = ModuleId::new(&coordinates.group, &coordinates.artifact);
         let model = self.model(&module, &coordinates.version)?;
         Ok(model
@@ -666,25 +683,30 @@ impl Resolver {
     }
 
     /// The runtime variant's dependencies, plus the constraints it publishes.
-    fn metadata_declarations(&mut self, coordinates: &Coordinates) -> Vec<(Declaration, Claim)> {
+    fn metadata_declarations(
+        &mut self,
+        coordinates: &Coordinates,
+    ) -> Result<Vec<(Declaration, Claim)>, NdkError> {
         let Some(module) = self.metadata(coordinates) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         // A variant that redirects carries no dependencies of its own, so the
-        // module it points at is what actually declares them.
+        // module it points at is what actually declares them. A failure to read
+        // the target is reported rather than treated as "no dependencies",
+        // which would quietly strip the module's whole subtree.
         if let Some(redirect) = redirect_of(&module, coordinates) {
             log::debug!(
                 "{} redirects to {}; reading its dependencies there",
                 coordinates.gav(),
                 redirect.gav()
             );
-            return self.declarations(&redirect).unwrap_or_default();
+            return self.declarations(&redirect);
         }
         let selected = match module.select() {
             Ok(selected) => selected,
             Err(reason) => {
                 log::warn!("{}: {reason}; using its POM instead", coordinates.gav());
-                return Vec::new();
+                return self.pom_declarations(coordinates);
             }
         };
         let mut out = Vec::new();
@@ -717,7 +739,7 @@ impl Resolver {
                         })
                         .collect(),
                 },
-                Claim::Declared,
+                Claim::Undeclared,
             ));
         }
         for constraint in &selected.dependency_constraints {
@@ -740,7 +762,7 @@ impl Resolver {
                 Claim::Constraint,
             ));
         }
-        out
+        Ok(out)
     }
 
     /// Fetches and parses a module's Gradle Module Metadata, if it publishes
@@ -2046,8 +2068,9 @@ mod tests {
         resolver
     }
 
-    /// A module file whose runtime variant names `depends` and ships one jar.
-    fn gmm_with(group: &str, artifact: &str, depends: &str) -> String {
+    /// A module file whose runtime variant names `depends` and ships one
+    /// archive of the given kind.
+    fn gmm_with(group: &str, artifact: &str, depends: &str, elements: &str) -> String {
         format!(
             r#"{{
                  "formatVersion": "1.1",
@@ -2058,9 +2081,9 @@ mod tests {
                      "attributes": {{
                        "org.gradle.category": "library",
                        "org.gradle.usage": "java-runtime",
-                       "org.gradle.libraryelements": "aar"
+                       "org.gradle.libraryelements": "{elements}"
                      }},
-                     "files": [{{"name":"x.aar","url":"x.aar","size":1,"sha1":"ab"}}],
+                     "files": [{{"name":"x.{elements}","url":"x.{elements}","size":1,"sha1":"ab"}}],
                      "dependencies": [{depends}]
                    }}
                  ]
@@ -2187,12 +2210,23 @@ mod tests {
                         "g",
                         "other",
                         r#"{"group":"g","module":"wanted","version":{"requires":"1.6.0"}}"#,
+                        "aar",
                     ),
                 ),
                 ("g", "wanted", "1.0", &gmm_redirect("wanted-jvm")),
                 ("g", "wanted", "1.6.0", &gmm_redirect("wanted-jvm")),
-                ("g", "wanted-jvm", "1.0", &gmm_with("g", "wanted-jvm", "")),
-                ("g", "wanted-jvm", "1.6.0", &gmm_with("g", "wanted-jvm", "")),
+                (
+                    "g",
+                    "wanted-jvm",
+                    "1.0",
+                    &gmm_with("g", "wanted-jvm", "", "jar"),
+                ),
+                (
+                    "g",
+                    "wanted-jvm",
+                    "1.6.0",
+                    &gmm_with("g", "wanted-jvm", "", "jar"),
+                ),
             ],
         );
         seed_roots(&mut resolver, &[("g", "root", "1.0")]);
@@ -2208,7 +2242,10 @@ mod tests {
             .collect();
         assert_eq!(wanted.len(), 1, "{resolved:?}");
         assert_eq!(wanted[0].coordinates.gav(), "g:wanted-jvm:1.6.0");
-        assert_eq!(wanted[0].extension.as_deref(), Some("aar"));
+        assert_eq!(wanted[0].extension.as_deref(), Some("jar"));
+        // The packaging follows the archive that will actually be fetched, so
+        // a `libraryelements: jar` module is not reported as an AAR.
+        assert_eq!(wanted[0].packaging, "jar");
         // And the redirecting module's own coordinates are not fetched, which
         // is what keeps a stub jar off the classpath.
         assert!(

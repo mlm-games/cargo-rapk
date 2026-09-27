@@ -109,10 +109,10 @@ fn bound(text: &str, inclusive: bool) -> Option<Bound> {
 
 /// What a dependency asked for.
 ///
-/// `is_soft` is what makes mediation work: a range, an alias, or a
-/// recommendation yields to a nearer dependency that names a version outright,
-/// which is Maven Resolver's `JavaDependencyContextRefiner` treating a managed
-/// or ranged version as a restriction rather than a fixed choice.
+/// Only [`Requirement::Exact`] names a version outright. Everything else is
+/// resolved against the repository's version list, which is why a range, a
+/// `LATEST` alias and an unclassified specification all need the network before
+/// they can be turned into a version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requirement {
     /// A version written in full, e.g. `1.7.0`.
@@ -161,11 +161,6 @@ impl Requirement {
         } else {
             Self::Exact(version)
         }
-    }
-
-    /// Whether this requirement yields to a nearer concrete version.
-    pub fn is_soft(&self) -> bool {
-        !matches!(self, Self::Exact(_))
     }
 
     /// The version this requirement selects.
@@ -218,7 +213,6 @@ mod tests {
     #[test]
     fn a_bare_version_is_taken_as_written() {
         assert!(matches!(Requirement::parse("1.7.0"), Requirement::Exact(_)));
-        assert!(!Requirement::parse("1.7.0").is_soft());
         assert_eq!(
             resolved("1.7.0", &["1.6.0", "1.8.0"]).as_deref(),
             Some("1.7.0")
@@ -227,9 +221,12 @@ mod tests {
 
     #[test]
     fn brackets_must_balance_or_the_spec_is_a_recommendation() {
-        assert!(Requirement::parse("[1.0,2.0)").is_soft());
-        assert!(Requirement::parse("[1.0").is_soft());
-        assert!(!Requirement::parse("1.0").is_soft());
+        assert!(matches!(
+            Requirement::parse("[1.0,2.0)"),
+            Requirement::Range(_)
+        ));
+        assert!(matches!(Requirement::parse("[1.0"), Requirement::Soft(_)));
+        assert!(matches!(Requirement::parse("1.0"), Requirement::Exact(_)));
     }
 
     #[test]
@@ -300,11 +297,12 @@ mod tests {
 
     #[test]
     fn an_unsubstituted_property_is_a_recommendation_and_never_a_fixed_version() {
-        // `${revision}` means interpolation failed, so this must not be allowed
-        // to win mediation as though it named a version.
-        let requirement = Requirement::parse("${unresolved.property}");
-        assert!(requirement.is_soft());
-        assert!(matches!(requirement, Requirement::Soft(_)));
+        // `${revision}` means interpolation failed, so it must not be treated as
+        // a version that was named outright.
+        assert!(matches!(
+            Requirement::parse("${unresolved.property}"),
+            Requirement::Soft(_)
+        ));
     }
 
     #[test]
