@@ -8,10 +8,10 @@
 ![MIT](https://img.shields.io/badge/License-MIT-green.svg)
 ![Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-green.svg)
 
-Tool for creating Android packages from native Rust crates, requiring minimal setup and tooling.  Ideal for apps that provide a [`NativeActivity`] via our [`ndk` crate].
+Tool for creating Android packages from native Rust crates, requiring minimal setup and tooling.  Ideal for apps that provide a [`NativeActivity`] via the [`rndk` crate].
 
 [`NativeActivity`]: https://developer.android.com/reference/android/app/NativeActivity
-[`ndk` crate]: https://crates.io/crates/ndk
+[`rndk` crate]: https://crates.io/crates/rndk
 
 ## Installation
 
