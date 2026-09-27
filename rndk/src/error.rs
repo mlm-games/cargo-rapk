@@ -61,7 +61,7 @@ pub enum NdkError {
     NonUtf8Path(PathBuf),
     #[error("Output of `{0}` is not valid UTF-8")]
     NonUtf8Output(&'static str),
-    #[error("Timestamp {0} is out of the range a zip entry can represent (1980-2107)")]
+    #[error("Timestamp {0} is past 2107, the latest a zip entry timestamp can represent")]
     TimestampOutOfRange(i64),
     #[error("Failed to read or rewrite the zip archive: {0}")]
     Zip(#[from] zip::result::ZipError),

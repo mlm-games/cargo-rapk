@@ -6,21 +6,32 @@ use zip::{
     write::{ExtendedFileOptions, FileOptions},
 };
 
+/// 1980-01-01T00:00:00Z: the DOS epoch, and the earliest timestamp a zip entry
+/// can record. A DOS date is a 7-bit year offset from 1980, so anything earlier
+/// is simply not representable.
+const DOS_EPOCH_UNIX: i64 = 315_532_800;
+
 /// The DOS epoch, the earliest timestamp a zip entry can represent, and the
 /// default for a reproducible build.
 pub fn dos_epoch() -> Result<DateTime, NdkError> {
     DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
-        .map_err(|_| NdkError::TimestampOutOfRange(315_532_800))
+        .map_err(|_| NdkError::TimestampOutOfRange(DOS_EPOCH_UNIX))
 }
 
 /// Convert a Unix timestamp (seconds since epoch) to a DOS [`DateTime`], which
 /// cannot represent anything outside 1980-2107.
+///
+/// Timestamps before 1980 are clamped to the DOS epoch rather than rejected,
+/// so the conventional `SOURCE_DATE_EPOCH=0` behaves as "as early as the format
+/// allows". Timestamps past 2107 are rejected, because there is no correct
+/// value to clamp them to.
 pub fn unix_ts_to_dos(ts: u64) -> Result<DateTime, NdkError> {
     let ts = i64::try_from(ts).map_err(|_| NdkError::TimestampOutOfRange(i64::MAX))?;
-    let out_of_range = || NdkError::TimestampOutOfRange(ts);
-    let odt = OffsetDateTime::from_unix_timestamp(ts).map_err(|_| out_of_range())?;
+    let ts = ts.max(DOS_EPOCH_UNIX);
+    let odt =
+        OffsetDateTime::from_unix_timestamp(ts).map_err(|_| NdkError::TimestampOutOfRange(ts))?;
     let pdt = PrimitiveDateTime::new(odt.date(), odt.time());
-    DateTime::try_from(pdt).map_err(|_| out_of_range())
+    DateTime::try_from(pdt).map_err(|_| NdkError::TimestampOutOfRange(ts))
 }
 
 /// Normalize a ZIP: set deterministic mtimes, strip variable extra fields, and
@@ -75,4 +86,42 @@ pub fn normalize_zip(data: &[u8], ts: Option<u64>) -> Result<Vec<u8>, NdkError> 
 
     let cursor = writer.finish()?;
     Ok(cursor.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dos(ts: u64) -> (u16, u8, u8) {
+        let dt = unix_ts_to_dos(ts).expect("should convert");
+        (dt.year(), dt.month(), dt.day())
+    }
+
+    #[test]
+    fn timestamps_before_the_dos_epoch_clamp() {
+        // The conventional reproducible-build value must not be an error.
+        assert_eq!(dos(0), (1980, 1, 1));
+        assert_eq!(dos(1), (1980, 1, 1));
+        assert_eq!(dos(DOS_EPOCH_UNIX as u64 - 1), (1980, 1, 1));
+    }
+
+    #[test]
+    fn timestamps_from_the_dos_epoch_onward_are_exact() {
+        assert_eq!(dos(DOS_EPOCH_UNIX as u64), (1980, 1, 1));
+        assert_eq!(dos(1_700_000_000), (2023, 11, 14));
+    }
+
+    #[test]
+    fn timestamps_past_2107_are_rejected() {
+        // 2107-12-31 is the last representable year; 2108-01-01 is not.
+        assert!(unix_ts_to_dos(4_354_732_800).is_ok());
+        assert!(matches!(
+            unix_ts_to_dos(4_354_819_200),
+            Err(NdkError::TimestampOutOfRange(_))
+        ));
+        assert!(matches!(
+            unix_ts_to_dos(u64::MAX),
+            Err(NdkError::TimestampOutOfRange(_))
+        ));
+    }
 }
