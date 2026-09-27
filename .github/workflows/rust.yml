@@ -173,7 +173,10 @@ jobs:
         if: ${{ always() }}
         with:
           name: app-logs-${{ matrix.source_os }}
-          path: ~/logcat.log
+          if-no-files-found: ignore
+          path: |
+            ~/app.log
+            ~/logcat.log
 
   build-host:
     strategy:
