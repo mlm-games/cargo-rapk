@@ -183,6 +183,16 @@ impl<'a> ApkBuilder<'a> {
         };
     }
 
+    /// Forwards the parsed cargo args, dropping `--target` when `--universal`
+    /// already substituted it, so cargo never sees two.
+    fn apply_cargo_args(&self, cargo: &mut std::process::Command) {
+        let mut args = self.cmd.args().clone();
+        if self.universal {
+            args.target = None;
+        }
+        args.apply(cargo);
+    }
+
     /// The directory relative paths in the manifest resolve against.
     fn crate_path(&self) -> Result<&Path, Error> {
         self.cmd
@@ -373,7 +383,7 @@ impl<'a> ApkBuilder<'a> {
             if self.cmd.target().is_none() || self.universal {
                 cargo.arg("--target").arg(target.rust_triple());
             }
-            self.cmd.args().apply(&mut cargo);
+            self.apply_cargo_args(&mut cargo);
             apply_manifest_features(&self.manifest, &mut cargo);
             if !cargo.status()?.success() {
                 return Err(NdkError::CmdFailed(Box::new(cargo)).into());
@@ -643,7 +653,7 @@ impl<'a> ApkBuilder<'a> {
             if self.cmd.target().is_none() || self.universal {
                 cargo.arg("--target").arg(triple);
             }
-            self.cmd.args().apply(&mut cargo);
+            self.apply_cargo_args(&mut cargo);
             apply_manifest_features(&self.manifest, &mut cargo);
             if !cargo.status()?.success() {
                 return Err(NdkError::CmdFailed(Box::new(cargo)).into());
@@ -812,7 +822,7 @@ impl<'a> ApkBuilder<'a> {
                 },
             )?;
             cargo.arg(cargo_cmd);
-            self.cmd.args().apply(&mut cargo);
+            self.apply_cargo_args(&mut cargo);
             apply_manifest_features(&self.manifest, &mut cargo);
 
             if self.cmd.target().is_none() || self.universal {
