@@ -25,6 +25,7 @@ pub mod error;
 pub mod kotlin;
 pub mod libs;
 pub mod manifest;
+pub mod maven;
 pub mod ndk;
 pub mod rustflags;
 pub mod target;

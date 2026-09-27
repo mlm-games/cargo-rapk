@@ -23,6 +23,8 @@ pub(crate) struct Manifest {
     pub(crate) assets: Option<PathBuf>,
     pub(crate) resources: Option<PathBuf>,
     pub(crate) java_sources: Vec<PathBuf>,
+    /// `group:artifact:version` Maven coordinates added to the dex.
+    pub(crate) android_libs: Vec<String>,
     pub(crate) runtime_libs: Option<PathBuf>,
     /// Maps profiles to keystores
     pub(crate) signing: HashMap<String, Signing>,
@@ -54,6 +56,7 @@ impl Manifest {
             assets: metadata.assets,
             resources: metadata.resources,
             java_sources: metadata.java_sources,
+            android_libs: metadata.android_libs,
             runtime_libs: metadata.runtime_libs,
             signing: metadata.signing,
             reverse_port_forward: metadata.reverse_port_forward,
@@ -112,6 +115,9 @@ struct AndroidMetadata {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_one_or_many")]
     java_sources: Vec<PathBuf>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_one_or_many")]
+    android_libs: Vec<String>,
     runtime_libs: Option<PathBuf>,
     /// Maps profiles to keystores
     #[serde(default)]

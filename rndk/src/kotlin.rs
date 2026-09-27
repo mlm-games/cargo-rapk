@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::NdkError;
+use crate::maven::{download_with_curl_or_wget, fetch_artifact, fetch_artifact_inner};
 
 /// Default pin, but maybe set it to latest always (could be bad)?.
 pub const DEFAULT_KOTLIN_VERSION: &str = "2.2.10";
@@ -319,7 +320,6 @@ pub fn kotlinc_command(path: &Path) -> Command {
 
 // It is the same compiler that Gradle plugin resolves (`kotlin-compiler-embeddable`),
 
-const MAVEN_BASE: &str = "https://repo.maven.apache.org/maven2";
 const KOTLIN_CLI_MAIN: &str = "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler";
 const EMBEDDABLE_ARTIFACT: &str = "kotlin-compiler-embeddable";
 const KOTLIN_GROUP: &str = "org.jetbrains.kotlin";
@@ -332,13 +332,6 @@ fn maven_dir(version: &str) -> PathBuf {
 
 fn maven_marker(version: &str) -> PathBuf {
     maven_dir(version).join(".cargo-rapk-version")
-}
-
-fn artifact_url(group: &str, artifact: &str, version: &str, ext: &str) -> String {
-    format!(
-        "{MAVEN_BASE}/{}/{artifact}/{version}/{artifact}-{version}.{ext}",
-        group.replace('.', "/")
-    )
 }
 
 #[derive(Debug, Clone)]
@@ -529,79 +522,6 @@ fn parse_pom_deps(pom_xml: &str) -> Vec<MavenDep> {
     deps
 }
 
-fn download_text(url: &str) -> Result<String, String> {
-    let tmp = std::env::temp_dir().join(format!("cargo-rapk-pom-{}", std::process::id()));
-    download_with_curl_or_wget(url, &tmp)?;
-    let text = std::fs::read_to_string(&tmp).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&tmp);
-    Ok(text)
-}
-
-fn verify_sha1(path: &Path, expected: &str) -> bool {
-    let actual = file_digest_hex(path, "sha1sum", "1", 40);
-    actual.is_some_and(|a| a == expected.trim().to_ascii_lowercase())
-}
-
-/// Download one Maven artifact + fail-closed `.sha1` check. Reuses verified files.
-fn fetch_artifact(
-    dir: &Path,
-    group: &str,
-    artifact: &str,
-    version: &str,
-    ext: &str,
-) -> Result<Option<PathBuf>, String> {
-    fetch_artifact_inner(dir, group, artifact, version, ext, false)
-}
-
-fn url_definitely_missing(url: &str) -> Option<bool> {
-    if which::which("curl").is_err() {
-        return None;
-    }
-    match Command::new("curl")
-        .arg("-fsSI")
-        .arg("-o")
-        .arg("/dev/null")
-        .arg(url)
-        .output()
-    {
-        Ok(out) if out.status.success() => Some(false),
-        Ok(out) if out.status.code() == Some(22) => Some(true),
-        _ => None,
-    }
-}
-
-fn fetch_artifact_inner(
-    dir: &Path,
-    group: &str,
-    artifact: &str,
-    version: &str,
-    ext: &str,
-    allow_unpublished: bool,
-) -> Result<Option<PathBuf>, String> {
-    let jar_url = artifact_url(group, artifact, version, ext);
-    let dest = dir.join(format!("{artifact}-{version}.{ext}"));
-    // Stale POMs can reference artifacts never published for this version
-    if allow_unpublished && url_definitely_missing(&jar_url) == Some(true) {
-        log::warn!("skipping unpublished {artifact}-{version}.{ext}");
-        return Ok(None);
-    }
-    let sha_url = artifact_url(group, artifact, version, &format!("{ext}.sha1"));
-    let want = download_text(&sha_url)
-        .ok()
-        .and_then(|t| t.split_whitespace().next().map(str::to_string))
-        .ok_or_else(|| format!("no usable .sha1 sidecar for {artifact}-{version}.{ext}"))?;
-    if dest.is_file() && verify_sha1(&dest, &want) {
-        return Ok(Some(dest));
-    }
-    let _ = std::fs::remove_file(&dest);
-    download_with_curl_or_wget(&artifact_url(group, artifact, version, ext), &dest)?;
-    if !verify_sha1(&dest, &want) {
-        let _ = std::fs::remove_file(&dest);
-        return Err(format!("sha1 mismatch for {artifact}-{version}.{ext}"));
-    }
-    Ok(Some(dest))
-}
-
 pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
     let version = normalize_pin(version);
     let dir = maven_dir(&version);
@@ -747,65 +667,8 @@ fn kotlin_zip_url(version: &str) -> String {
     )
 }
 
-fn download_with_curl_or_wget(url: &str, dest: &Path) -> Result<(), String> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    if which::which("curl").is_ok() {
-        let status = Command::new("curl")
-            .arg("-fsSL")
-            .arg("-o")
-            .arg(dest)
-            .arg(url)
-            .status()
-            .map_err(|e| format!("failed to run curl: {e}"))?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(format!("curl exited with {status} for {url}"));
-    }
-    if which::which("wget").is_ok() {
-        let status = Command::new("wget")
-            .arg("-qO")
-            .arg(dest)
-            .arg(url)
-            .status()
-            .map_err(|e| format!("failed to run wget: {e}"))?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(format!("wget exited with {status} for {url}"));
-    }
-    Err(
-        "neither `curl` nor `wget` found on PATH; install one or pre-seed the cache manually"
-            .into(),
-    )
-}
-
-fn file_digest_hex(path: &Path, tool: &str, shasum_bits: &str, hex_len: usize) -> Option<String> {
-    for attempt in [
-        vec![tool, &*path.to_string_lossy()],
-        vec!["shasum", "-a", shasum_bits, &*path.to_string_lossy()],
-    ] {
-        let (bin, args) = (attempt[0], &attempt[1..]);
-        if which::which(bin).is_err() {
-            continue;
-        }
-        let out = Command::new(bin).args(args).output().ok()?;
-        if !out.status.success() {
-            continue;
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let hex = stdout.split_whitespace().next().unwrap_or("").to_string();
-        if hex.len() == hex_len && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(hex.to_ascii_lowercase());
-        }
-    }
-    None
-}
-
 fn file_sha256_hex(path: &Path) -> Option<String> {
-    file_digest_hex(path, "sha256sum", "256", 64)
+    crate::maven::file_sha256_hex(path)
 }
 
 fn expected_sha256(version: &str, zip_path: &Path) -> Option<String> {
@@ -973,23 +836,6 @@ mod tests {
     fn legacy_class_name_is_not_a_path() {
         let class = PathBuf::from("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler");
         assert!(!class.exists());
-    }
-
-    #[test]
-    fn maven_artifact_urls() {
-        assert_eq!(
-            artifact_url("org.jetbrains.kotlin", "kotlin-stdlib", "2.2.10", "jar"),
-            "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.10/kotlin-stdlib-2.2.10.jar"
-        );
-        assert_eq!(
-            artifact_url(
-                "org.jetbrains.kotlinx",
-                "kotlinx-coroutines-core-jvm",
-                "1.8.0",
-                "pom"
-            ),
-            "https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.8.0/kotlinx-coroutines-core-jvm-1.8.0.pom"
-        );
     }
 
     #[test]

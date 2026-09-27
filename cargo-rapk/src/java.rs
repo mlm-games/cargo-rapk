@@ -107,13 +107,20 @@ fn collect_class_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
 pub(crate) fn compile_java_sources(
     ndk: &Ndk,
     source_dirs: &[PathBuf],
+    lib_jars: &[PathBuf],
     build_dir: &Path,
     min_sdk_version: u32,
     target_sdk_version: u32,
 ) -> Result<Vec<PathBuf>, Error> {
     let java_files = collect_java_files(source_dirs)?;
     let kt_files = collect_kotlin_files(source_dirs)?;
-    let jar_files = collect_jar_files(source_dirs)?;
+    let mut jar_files = collect_jar_files(source_dirs)?;
+    for lib_jar in lib_jars {
+        if !jar_files.contains(lib_jar) {
+            jar_files.push(lib_jar.clone());
+        }
+    }
+    jar_files.sort();
     if java_files.is_empty() && kt_files.is_empty() && jar_files.is_empty() {
         return Ok(Vec::new());
     }

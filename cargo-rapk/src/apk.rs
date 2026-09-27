@@ -202,6 +202,13 @@ impl<'a> ApkBuilder<'a> {
         Ok(java_sources)
     }
 
+    fn android_libs(&self) -> Result<Vec<String>, Error> {
+        let mut libs = self.manifest.android_libs.clone();
+        libs.extend(collect_android_contributions(self.cmd.manifest())?.android_libs);
+        libs.dedup();
+        Ok(libs)
+    }
+
     /// Resolves every external tool and input the build needs, without
     /// compiling, dexing or packaging anything.
     fn preflight(&self) -> Result<(), Error> {
@@ -267,6 +274,12 @@ impl<'a> ApkBuilder<'a> {
         if !no_sources && let Err(e) = self.ndk.d8() {
             problems.push(format!("d8: {e}"));
         }
+        for lib in self.android_libs()? {
+            if let Err(e) = rndk::maven::ensure_lib(&lib) {
+                problems.push(e.to_string());
+            }
+        }
+
         if !kt_files.is_empty() {
             match rndk::kotlin::resolve_toolchain() {
                 Some(_) => {}
@@ -317,6 +330,10 @@ impl<'a> ApkBuilder<'a> {
                     kt_files.len(),
                     jar_files.len()
                 ));
+            }
+            let libs = self.android_libs()?;
+            if !libs.is_empty() {
+                line.push_str(&format!(", {} android_libs", libs.len()));
             }
             println!("{line}");
             return Ok(());
@@ -479,7 +496,15 @@ impl<'a> ApkBuilder<'a> {
             .runtime_libs
             .as_ref()
             .map(|p| dunce::simplified(&crate_path.join(p)).to_owned());
-        if !java_sources.is_empty() {
+        let android_libs = self.android_libs()?;
+        let mut lib_jars = Vec::new();
+        for lib in &android_libs {
+            lib_jars.extend(rndk::maven::ensure_lib(lib)?.jars);
+        }
+        lib_jars.sort();
+        lib_jars.dedup();
+
+        if !java_sources.is_empty() || !lib_jars.is_empty() {
             manifest.application.has_code = true;
         }
         let apk_name = self
@@ -510,10 +535,11 @@ impl<'a> ApkBuilder<'a> {
         };
         let mut apk = config.create_apk()?;
 
-        if !java_sources.is_empty() {
+        if !java_sources.is_empty() || !lib_jars.is_empty() {
             let dex_files = compile_java_sources(
                 &self.ndk,
                 java_sources.as_slice(),
+                lib_jars.as_slice(),
                 &config.build_dir,
                 self.min_sdk_version(),
                 target_sdk_version,

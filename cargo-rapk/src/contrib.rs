@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default)]
 pub(crate) struct AndroidContributions {
     pub(crate) java_sources: Vec<PathBuf>,
+    pub(crate) android_libs: Vec<String>,
     pub(crate) activities: Vec<Activity>,
     pub(crate) services: Vec<Service>,
 }
@@ -64,6 +65,9 @@ struct CargoRapkContributionMetadata {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_one_or_many")]
     java_sources: Vec<PathBuf>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_one_or_many")]
+    android_libs: Vec<String>,
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_one_or_many")]
     activities: Vec<Activity>,
@@ -166,6 +170,8 @@ fn collect_from_metadata(metadata: CargoMetadata, manifest_path: &Path) -> Andro
 
     let mut java_sources = Vec::new();
     let mut java_source_set = HashSet::new();
+    let mut android_libs = Vec::new();
+    let mut android_lib_set = HashSet::new();
     let mut activity_names = HashSet::new();
     let mut activities = Vec::new();
     let mut service_names = HashSet::new();
@@ -200,6 +206,12 @@ fn collect_from_metadata(metadata: CargoMetadata, manifest_path: &Path) -> Andro
             }
         }
 
+        for android_lib in contrib.android_libs {
+            if android_lib_set.insert(android_lib.clone()) {
+                android_libs.push(android_lib);
+            }
+        }
+
         for activity in contrib.activities {
             if activity_names.insert(activity.name.clone()) {
                 activities.push(activity);
@@ -215,6 +227,7 @@ fn collect_from_metadata(metadata: CargoMetadata, manifest_path: &Path) -> Andro
 
     AndroidContributions {
         java_sources,
+        android_libs,
         activities,
         services,
     }

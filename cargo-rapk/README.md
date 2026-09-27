@@ -122,6 +122,22 @@ exported = false
 # (default `2.2.10`), `CARGO_RAPK_KOTLIN_SHA256`,
 # `CARGO_RAPK_FETCH_KOTLIN=never|force`, `CARGO_RAPK_NO_FETCH_KOTLIN=1`.
 
+# Maven `group:artifact:version` coordinates to add to the APK's dex and to
+# the `javac`/`kotlinc` classpath. `androidx.*` and `com.android.*` resolve
+# against Google's Maven, everything else against Maven Central. Downloads are
+# `.sha1`-verified and cached in
+# `$XDG_CACHE_HOME/cargo-rapk/maven/<group>/<artifact>/<version>`; pins are
+# `CARGO_RAPK_FETCH_MAVEN=never|force` and `CARGO_RAPK_NO_FETCH_MAVEN=1`.
+#
+# Only pure class containers are accepted. An AAR that ships `res/` or
+# contributes `<uses-permission>`, `<provider>`, `<service>`, … to the manifest
+# is rejected at preflight, because merging those needs the resource and
+# manifest mergers that only the Android Gradle plugin provides — silently
+# dropping them yields an app that crashes on device instead of at build time.
+# No transitive resolution: list every artifact you need explicitly.
+# `android_libs = ["org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"]
+android_libs = "org.example:some-library:1.2.3"
+
 # Path to the folder containing your application's assets.
 # If not specified, assets will not be included in the APK.
 assets = "path/to/assets_folder"
