@@ -4,7 +4,7 @@ use rndk::ndk::Ndk;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn collect_kotlin_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+pub(crate) fn collect_kotlin_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     let mut kt_files = Vec::new();
     for source_dir in source_dirs {
         if !source_dir.exists() {
@@ -32,7 +32,7 @@ fn collect_kotlin_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> 
     Ok(kt_files)
 }
 
-fn collect_java_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+pub(crate) fn collect_java_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     let mut java_files = Vec::new();
     for source_dir in source_dirs {
         if !source_dir.exists() {
@@ -60,7 +60,7 @@ fn collect_java_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     Ok(java_files)
 }
 
-fn collect_jar_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+pub(crate) fn collect_jar_files(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     let mut jar_files = Vec::new();
     for source_dir in source_dirs {
         let mut stack = vec![source_dir.clone()];

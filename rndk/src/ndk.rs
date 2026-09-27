@@ -11,6 +11,14 @@ pub const DEFAULT_DEV_KEYSTORE_PASSWORD: &str = "android";
 
 const D8_MAIN_CLASS: &str = "com.android.tools.r8.D8";
 
+fn tool_bin(tool: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{tool}.exe")
+    } else {
+        tool.to_string()
+    }
+}
+
 fn is_tty() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -406,7 +414,7 @@ impl Ndk {
     }
 
     pub fn build_tool_path(&self, tool: &str) -> Result<PathBuf, NdkError> {
-        let path = self.build_tools_dir().join(tool);
+        let path = self.build_tools_dir().join(tool_bin(tool));
         if !path.exists() {
             return Err(NdkError::CmdNotFound(tool.to_string()));
         }
@@ -422,7 +430,7 @@ impl Ndk {
     }
 
     pub fn platform_tool_path(&self, tool: &str) -> Result<PathBuf, NdkError> {
-        let path = self.sdk_path.join("platform-tools").join(tool);
+        let path = self.sdk_path.join("platform-tools").join(tool_bin(tool));
         if !path.exists() {
             return Err(NdkError::CmdNotFound(tool.to_string()));
         }
@@ -430,7 +438,7 @@ impl Ndk {
     }
 
     pub fn adb_path(&self) -> Result<PathBuf, NdkError> {
-        self.platform_tool_path(bin!("adb"))
+        self.platform_tool_path("adb")
     }
 
     pub fn platform_tool(&self, tool: &str) -> Result<Command, NdkError> {

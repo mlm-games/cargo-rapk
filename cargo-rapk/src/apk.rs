@@ -1,11 +1,14 @@
 use crate::contrib::collect_android_contributions;
 use crate::error::Error;
-use crate::java::compile_java_sources;
+use crate::java::{
+    collect_jar_files, collect_java_files, collect_kotlin_files, compile_java_sources,
+};
 use crate::manifest::{Inheritable, Manifest, Root};
 use cargo_subcommand::{Artifact, ArtifactType, CrateType, Profile, Subcommand};
 use rndk::apk::{Apk, ApkConfig, BuildFormat};
 use rndk::cargo::{VersionCode, cargo_ndk};
 use rndk::error::NdkError;
+use rndk::libs::{LibResolver, LibSource};
 use rndk::manifest::{IntentFilter, MetaData};
 use rndk::ndk::{Key, Ndk};
 use rndk::target::Target;
@@ -179,7 +182,146 @@ impl<'a> ApkBuilder<'a> {
         };
     }
 
+    fn java_sources(&self) -> Result<Vec<PathBuf>, Error> {
+        let crate_path = self.cmd.manifest().parent().expect("invalid manifest path");
+        let mut java_sources = self
+            .manifest
+            .java_sources
+            .iter()
+            .map(|p| dunce::simplified(&crate_path.join(p)).to_owned())
+            .collect::<Vec<_>>();
+        java_sources.extend(collect_android_contributions(self.cmd.manifest())?.java_sources);
+        Ok(java_sources)
+    }
+
+    /// Resolves every external tool and input the build needs, without
+    /// compiling, dexing or packaging anything.
+    fn preflight(&self) -> Result<(), Error> {
+        let mut problems = Vec::new();
+
+        let target_sdk_version = self
+            .manifest
+            .android_manifest
+            .sdk
+            .target_sdk_version
+            .unwrap_or_else(|| self.ndk.default_target_platform());
+        if let Err(e) = self.ndk.android_jar(target_sdk_version) {
+            problems.push(format!(
+                "target SDK {target_sdk_version}: {e}; install it with \
+                 `sdkmanager \"platforms;android-{target_sdk_version}\"`"
+            ));
+        }
+
+        let build_tools = self.ndk.build_tools_version().to_owned();
+        let packaging_tools: &[&str] = match self.format {
+            BuildFormat::Apk => &["aapt", "zipalign"],
+            BuildFormat::Aab => &["aapt2"],
+        };
+        for tool in packaging_tools {
+            if let Err(e) = self.ndk.build_tool_path(tool) {
+                problems.push(format!("build-tools {build_tools}: {tool}: {e}"));
+            }
+        }
+
+        let java_sources = self.java_sources()?;
+        let mut missing_sources = false;
+        for dir in &java_sources {
+            if !dir.is_dir() {
+                problems.push(format!(
+                    "java_sources path `{}` does not exist",
+                    dir.display()
+                ));
+                missing_sources = true;
+            }
+        }
+        let (java_files, kt_files, jar_files) = if missing_sources {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            (
+                collect_or_problem(collect_java_files, &java_sources, &mut problems),
+                collect_or_problem(collect_kotlin_files, &java_sources, &mut problems),
+                collect_or_problem(collect_jar_files, &java_sources, &mut problems),
+            )
+        };
+        let no_sources = java_files.is_empty() && kt_files.is_empty() && jar_files.is_empty();
+
+        if !java_sources.is_empty() && no_sources && !missing_sources {
+            problems.push(format!(
+                "java_sources hold no .java, .kt or .jar files: {}",
+                join_display(&java_sources)
+            ));
+        }
+        if !java_files.is_empty()
+            && let Err(e) = self.ndk.javac()
+        {
+            problems.push(format!("javac: {e}"));
+        }
+        if !no_sources && let Err(e) = self.ndk.d8() {
+            problems.push(format!("d8: {e}"));
+        }
+        if !kt_files.is_empty() {
+            match rndk::kotlin::resolve_toolchain() {
+                Some(_) => {}
+                None if rndk::kotlin::fetch_disabled() => problems.push(format!(
+                    "kotlinc {} is unavailable and fetching is disabled; set \
+                     CARGO_RAPK_KOTLINC or KOTLIN_HOME",
+                    rndk::kotlin::kotlin_version()
+                )),
+                None => println!(
+                    "note: kotlinc {} will be fetched into {}",
+                    rndk::kotlin::kotlin_version(),
+                    rndk::kotlin::kotlin_cache_dir().display()
+                ),
+            }
+        }
+
+        if !self.repro.unsigned {
+            let (tool, resolved) = match self.format {
+                BuildFormat::Apk => ("apksigner", self.ndk.apksigner().map(|_| ())),
+                BuildFormat::Aab => ("jarsigner", self.ndk.jarsigner().map(|_| ())),
+            };
+            if let Err(e) = resolved {
+                problems.push(format!("{tool}: {e}"));
+            }
+        }
+
+        if let Some(sysroot) = rustc_sysroot(self.cmd.manifest()) {
+            for target in &self.build_targets {
+                let triple = target.rust_triple();
+                if !sysroot.join("lib/rustlib").join(triple).is_dir() {
+                    eprintln!(
+                        "warning: no std for rust target `{triple}` in {}; \
+                         run `rustup target add {triple}`",
+                        sysroot.display()
+                    );
+                }
+            }
+        }
+
+        if problems.is_empty() {
+            let mut line =
+                format!("preflight ok: build-tools {build_tools}, target SDK {target_sdk_version}");
+            if !java_sources.is_empty() {
+                line.push_str(&format!(
+                    ", {} java source dirs ({} .java, {} .kt, {} .jar)",
+                    java_sources.len(),
+                    java_files.len(),
+                    kt_files.len(),
+                    jar_files.len()
+                ));
+            }
+            println!("{line}");
+            return Ok(());
+        }
+
+        Err(Error::Preflight(
+            problems.into_iter().map(|p| format!("  - {p}")).collect(),
+        ))
+    }
+
     pub fn check(&self) -> Result<(), Error> {
+        self.preflight()?;
+
         for target in &self.build_targets {
             let mut cargo = cargo_ndk(
                 &self.ndk,
@@ -221,15 +363,9 @@ impl<'a> ApkBuilder<'a> {
         }
         let crate_path = self.cmd.manifest().parent().expect("invalid manifest path");
 
-        let mut java_sources = self
-            .manifest
-            .java_sources
-            .iter()
-            .map(|p| dunce::simplified(&crate_path.join(p)).to_owned())
-            .collect::<Vec<_>>();
+        let java_sources = self.java_sources()?;
 
         let contrib = collect_android_contributions(self.cmd.manifest())?;
-        java_sources.extend(contrib.java_sources);
 
         let mut existing_activity_names = manifest
             .application
@@ -411,15 +547,24 @@ impl<'a> ApkBuilder<'a> {
                 self.cmd.profile().as_ref(),
             )?;
             libs_search_paths.push(build_dir.join("deps"));
-            let libs_search_paths = libs_search_paths
-                .iter()
-                .map(|p| p.as_path())
-                .collect::<Vec<_>>();
+            libs_search_paths.sort();
 
-            apk.add_lib_recursively(&artifact, *target, libs_search_paths.as_slice())?;
+            // Register every library the caller named before resolving, so that
+            // precedence cannot depend on which one is reached first.
+            let mut libs = LibResolver::new(
+                &self.ndk,
+                *target,
+                self.min_sdk_version(),
+                libs_search_paths,
+            )?;
+            libs.register(LibSource::MainLib, &artifact)?;
             if let Some(runtime_libs) = &runtime_libs {
-                apk.add_runtime_libs(runtime_libs, *target, libs_search_paths.as_slice())?;
+                libs.register_dir(
+                    LibSource::Explicit,
+                    &runtime_libs.join(target.android_abi()),
+                )?;
             }
+            apk.add_libs(&mut libs, *target)?;
         }
 
         let unsigned = apk.add_pending_libs_and_align()?;
@@ -603,6 +748,42 @@ impl<'a> ApkBuilder<'a> {
             .unwrap_or(23)
             .max(23)
     }
+}
+
+fn collect_or_problem(
+    collect: fn(&[PathBuf]) -> Result<Vec<PathBuf>, Error>,
+    dirs: &[PathBuf],
+    problems: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    match collect(dirs) {
+        Ok(files) => files,
+        Err(e) => {
+            problems.push(e.to_string());
+            Vec::new()
+        }
+    }
+}
+
+fn join_display(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn rustc_sysroot(manifest_path: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .current_dir(manifest_path.parent()?)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8(output.stdout).ok()?;
+    let sysroot = sysroot.trim();
+    (!sysroot.is_empty()).then(|| PathBuf::from(sysroot))
 }
 
 fn apply_manifest_features(manifest: &Manifest, cargo: &mut std::process::Command) {

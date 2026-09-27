@@ -48,6 +48,8 @@ pub enum Error {
         "No buildable artifacts: `cargo rapk` needs a `cdylib` library target (select it with `--lib`), example, or binary"
     )]
     NoArtifacts,
+    #[error("Preflight found problems that would fail the build:\n{}", .0.join("\n"))]
+    Preflight(Vec<String>),
 }
 
 impl Error {

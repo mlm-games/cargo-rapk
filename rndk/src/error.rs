@@ -81,4 +81,10 @@ pub enum NdkError {
     PackageNotInOutput { package: String, output: String },
     #[error("Could not find `uid:` in output `{0}`")]
     UidNotInOutput(String),
+    #[error(
+        "More than one library named `{name}` was found with differing contents, and none of \
+         them is named by `runtime_libs` to break the tie:\n  {candidates}\n\
+         Remove the extra copies, or point `runtime_libs` at the one to package."
+    )]
+    AmbiguousLibrary { name: String, candidates: String },
 }

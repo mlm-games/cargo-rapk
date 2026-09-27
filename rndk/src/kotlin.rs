@@ -233,7 +233,7 @@ pub fn resolve_stdlib_path() -> Option<PathBuf> {
     None
 }
 
-fn fetch_disabled() -> bool {
+pub fn fetch_disabled() -> bool {
     if std::env::var("CARGO_RAPK_NO_FETCH_KOTLIN")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)

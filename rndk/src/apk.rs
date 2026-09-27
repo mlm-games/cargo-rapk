@@ -1,11 +1,11 @@
 use serde::Deserialize;
 
 use crate::error::NdkError;
+use crate::libs::LibResolver;
 use crate::manifest::AndroidManifest;
 use crate::ndk::{Key, Ndk};
 use crate::target::Target;
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -125,7 +125,7 @@ impl ApkConfig {
             .target_sdk_version
             .unwrap_or_else(|| self.ndk.default_target_platform());
 
-        let mut aapt = self.build_tool(bin!("aapt"))?;
+        let mut aapt = self.build_tool("aapt")?;
         aapt.arg("package")
             .arg("-f")
             .arg("-F")
@@ -167,7 +167,7 @@ impl ApkConfig {
             .target_sdk_version
             .unwrap_or_else(|| self.ndk.default_target_platform());
 
-        let mut aapt2 = self.build_tool(bin!("aapt2"))?;
+        let mut aapt2 = self.build_tool("aapt2")?;
         aapt2
             .arg("link")
             .arg("--proto-format")
@@ -181,7 +181,7 @@ impl ApkConfig {
         if let Some(res) = &self.resources {
             let compiled = self.build_dir.join("compiled_res");
             fs::create_dir_all(&compiled)?;
-            let mut compile = self.build_tool(bin!("aapt2"))?;
+            let mut compile = self.build_tool("aapt2")?;
             compile
                 .arg("compile")
                 .arg("-o")
@@ -292,23 +292,6 @@ impl<'a> UnalignedApk<'a> {
         Ok(())
     }
 
-    pub fn add_runtime_libs(
-        &mut self,
-        path: &Path,
-        target: Target,
-        search_paths: &[&Path],
-    ) -> Result<(), NdkError> {
-        let abi_dir = path.join(target.android_abi());
-        for entry in fs::read_dir(&abi_dir).map_err(|e| NdkError::IoPathError(abi_dir, e))? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension() == Some(OsStr::new("so")) {
-                self.add_lib_recursively(&path, target, search_paths)?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn add_file(&mut self, src: &Path, dst: &Path) -> Result<(), NdkError> {
         if !src.exists() {
             return Err(NdkError::PathNotFound(src.into()));
@@ -327,6 +310,15 @@ impl<'a> UnalignedApk<'a> {
         };
         self.pending_entries.insert(archive_path);
 
+        Ok(())
+    }
+
+    /// Packages the resolved library closure. Each name is added exactly once,
+    /// so the result does not depend on the order the closure was discovered in.
+    pub fn add_libs(&mut self, libs: &mut LibResolver, target: Target) -> Result<(), NdkError> {
+        for path in libs.resolve()?.into_values() {
+            self.add_lib(&path, target)?;
+        }
         Ok(())
     }
 
@@ -351,7 +343,7 @@ impl<'a> UnalignedApk<'a> {
 
     fn finalize_apk(self) -> Result<UnsignedApk<'a>, NdkError> {
         // add libs in stable order
-        let mut aapt = self.config.build_tool(bin!("aapt"))?;
+        let mut aapt = self.config.build_tool("aapt")?;
         aapt.arg("add");
         if self.config.disable_aapt_compression {
             aapt.arg("-0").arg("");
@@ -375,7 +367,7 @@ impl<'a> UnalignedApk<'a> {
             .map_err(|e| NdkError::IoPathError(self.config.unaligned_apk(), e))?;
         }
 
-        let mut zipalign = self.config.build_tool(bin!("zipalign"))?;
+        let mut zipalign = self.config.build_tool("zipalign")?;
         zipalign.arg("-f").arg("-v");
 
         // overridden with CARGO_RAPK_PAGE_SIZE_KB (allowed values per zipalign: 4, 16, 64).
