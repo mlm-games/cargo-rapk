@@ -9,6 +9,7 @@
 //! nearer dependency naming a version outright.
 
 use crate::error::NdkError;
+use crate::gmm;
 use crate::maven::{self, Coordinates};
 use crate::range::Requirement;
 use crate::version::MavenVersion;
@@ -272,6 +273,35 @@ struct Pending {
     root: bool,
 }
 
+/// How a declaration's version reached it.
+enum Claim {
+    /// Written in the declaration itself.
+    Declared,
+    /// Left out and filled in from `dependencyManagement` or a BOM.
+    Version(String),
+    /// Never written anywhere, which the resolver reports rather than guesses.
+    Undeclared,
+    /// A `dependencyConstraint`: advice about a version, not a request for the
+    /// artifact. It competes for a module already in the graph and is otherwise
+    /// ignored, which is what Gradle's `dependencyConstraints` does.
+    Constraint,
+}
+
+/// The coordinates a module's runtime variant redirects to, if any.
+fn redirect_of(module: &gmm::Module, coordinates: &Coordinates) -> Option<Coordinates> {
+    let selected = module.select().ok()?;
+    let available = selected.available_at.as_ref()?;
+    let mut version = available.version.clone();
+    if version.is_empty() {
+        version = coordinates.version.clone();
+    }
+    Some(Coordinates {
+        group: available.group.clone(),
+        artifact: available.module.clone(),
+        version,
+    })
+}
+
 /// An artifact that belongs on the classpath.
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -279,9 +309,13 @@ pub struct Resolved {
     /// `pom` artifacts are BOMs and are never packaged, so they are left out
     /// of the closure.
     pub packaging: String,
+    /// The archive to fetch, when the metadata named one. `None` probes for an
+    /// AAR and then a jar, which is all a POM can tell us.
+    pub extension: Option<String>,
 }
 
-/// How many times a `<relocation>` chain is followed before giving up.
+/// How many times a `<relocation>` or `available-at` chain is followed before
+/// giving up.
 const MAX_RELOCATIONS: usize = 8;
 
 /// Resolves `roots` and their transitive dependencies.
@@ -294,6 +328,7 @@ pub fn resolve(roots: &[Coordinates]) -> Result<Vec<Resolved>, NdkError> {
             0,
             Vec::new(),
             true,
+            false,
         )?;
     }
     resolver.walk();
@@ -307,11 +342,17 @@ struct Resolver {
     models: HashMap<Coordinates, Model>,
     /// Raw POM documents, so relocation and inheritance share one fetch.
     documents: HashMap<Coordinates, Pom>,
+    /// Gradle Module Metadata by coordinates. `None` records a module that
+    /// publishes none, so the POM path is only tried once.
+    metadata: HashMap<Coordinates, Option<gmm::Module>>,
     /// Coordinates whose model is being built, to catch a parent cycle.
     building: BTreeSet<Coordinates>,
     /// Published versions per module, for ranges and `LATEST`.
     available: HashMap<ModuleId, Vec<MavenVersion>>,
     selected: BTreeMap<ModuleId, Selection>,
+    /// The newest version any `dependencyConstraint` has recommended for a
+    /// module, held until something actually wants that module.
+    constrained: BTreeMap<ModuleId, String>,
     /// The exclusions each module was last expanded under. Exclusions are
     /// path-dependent, so a path carrying exclusions the module has not seen
     /// yet re-expands it.
@@ -329,6 +370,10 @@ impl Resolver {
     }
 
     /// Records a dependency's claim on a module, keeping the better claim.
+    ///
+    /// A `constraint` is version advice rather than a request: it competes only
+    /// for a module something else already wants, and if that happens later the
+    /// advice is applied then.
     fn consider(
         &mut self,
         module: ModuleId,
@@ -336,11 +381,22 @@ impl Resolver {
         depth: usize,
         excluded: Vec<Exclusion>,
         root: bool,
+        constraint: bool,
     ) -> Result<(), NdkError> {
         if excluded.iter().any(|e| e.matches(&module)) {
             return Ok(());
         }
         let (module, version) = self.concrete(module, &requirement)?;
+        if constraint && !self.selected.contains_key(&module) {
+            let best = self
+                .constrained
+                .entry(module)
+                .or_insert_with(|| version.clone());
+            if MavenVersion::new(&version) > MavenVersion::new(best) {
+                *best = version;
+            }
+            return Ok(());
+        }
         self.order += 1;
         let claim = Selection {
             ordering: MavenVersion::new(&version),
@@ -356,14 +412,38 @@ impl Resolver {
         {
             return Ok(());
         }
-        self.selected.insert(module.clone(), claim);
+        let first_time = self.selected.insert(module.clone(), claim).is_none();
         self.pending.push_back(Pending {
-            module,
+            module: module.clone(),
             version,
             depth,
             excluded,
             root,
         });
+        if first_time && let Some(advised) = self.constrained.remove(&module) {
+            let requirement = Requirement::parse(&advised);
+            let (module, version) = self.concrete(module, &requirement)?;
+            let claim = Selection {
+                ordering: MavenVersion::new(&version),
+                version: version.clone(),
+                depth,
+                order: self.order,
+            };
+            if self
+                .selected
+                .get(&module)
+                .is_none_or(|current| claim.beats(current))
+            {
+                self.selected.insert(module.clone(), claim);
+                self.pending.push_back(Pending {
+                    module,
+                    version,
+                    depth,
+                    excluded: Vec::new(),
+                    root: false,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -392,6 +472,11 @@ impl Resolver {
                 }
             };
             let coordinates = coordinates_of(&module, &version);
+            // `available-at` is *not* followed here. It says where the artifact
+            // is published, not which module the graph should record: the
+            // module a dependency names still has to mediate against every
+            // other claim on it, and rewriting the key would let one module
+            // ship two versions.
             match self.document(&coordinates)?.relocation.clone() {
                 Some(relocation) if !relocation.group_id.is_empty() => {
                     module = ModuleId::new(&relocation.group_id, &relocation.artifact_id);
@@ -430,10 +515,16 @@ impl Resolver {
             }
             self.expanded.insert(key, node.excluded.clone());
 
-            let model = match self.model(&node.module, &node.version) {
-                Ok(model) => model,
+            let coordinates = coordinates_of(&node.module, &node.version);
+            // Gradle reads the `.module` file in preference to the POM, and the
+            // two do not always agree: a module's runtime variant can name
+            // dependencies the POM's compile scope does not, and can point
+            // somewhere else entirely.
+            let declared = match self.declarations(&coordinates) {
+                Ok(declared) => declared,
                 // A root the user named by hand is kept even with no readable
-                // POM: there is then simply nothing to add to the classpath.
+                // metadata: there is then simply nothing to add to the
+                // classpath.
                 Err(e) if node.root => {
                     log::warn!("no dependencies resolved for {}: {e}", node.module);
                     continue;
@@ -444,15 +535,18 @@ impl Resolver {
                 }
             };
 
-            for declaration in &model.dependencies {
+            for (declaration, claim) in declared {
                 if declaration.optional || !declaration.scope.reaches_classpath() {
                     continue;
                 }
-                let managed = model.management.get(&declaration.module);
-                let spec = match (&declaration.version, managed) {
-                    (Some(version), _) => version.clone(),
-                    (None, Some(managed)) => managed.version.clone(),
-                    (None, None) => {
+                let (spec, constraint) = match (&declaration.version, claim) {
+                    (_, Claim::Constraint) => match &declaration.version {
+                        Some(version) => (version.clone(), true),
+                        None => continue,
+                    },
+                    (Some(version), _) => (version.clone(), false),
+                    (None, Claim::Version(version)) => (version, false),
+                    (None, Claim::Declared) | (None, Claim::Undeclared) => {
                         log::warn!(
                             "{} declares {} with no version and no \
                              `dependencyManagement` entry",
@@ -462,19 +556,6 @@ impl Resolver {
                         continue;
                     }
                 };
-                if spec.contains("${") {
-                    // Substitution already ran over the whole model, so a
-                    // property still standing here is one this resolver could
-                    // not resolve. Picking a version for it would put an
-                    // arbitrary artifact on the classpath.
-                    log::warn!(
-                        "{} declares {} at `{spec}`, which still holds an unresolved \
-                         property; skipping it",
-                        node.module,
-                        declaration.module
-                    );
-                    continue;
-                }
                 let mut excluded = node.excluded.clone();
                 excluded.extend(declaration.exclusions.iter().cloned());
                 let depth = node.depth + 1;
@@ -484,6 +565,7 @@ impl Resolver {
                     depth,
                     excluded,
                     false,
+                    constraint,
                 ) {
                     log::warn!("{e}");
                 }
@@ -491,25 +573,212 @@ impl Resolver {
         }
     }
 
-    fn results(&self) -> Vec<Resolved> {
-        self.selected
-            .iter()
-            .filter_map(|(module, selection)| {
-                let coordinates = Coordinates {
-                    group: module.group.clone(),
-                    artifact: module.artifact.clone(),
-                    version: selection.version.clone(),
+    /// The artifacts to fetch, one per selected module.
+    ///
+    /// A module whose runtime variant redirects is fetched from where the
+    /// metadata points, so `androidx.annotation:annotation` yields
+    /// `annotation-jvm`'s jar rather than the metadata stub published under its
+    /// own coordinates.
+    fn results(&mut self) -> Vec<Resolved> {
+        let mut out: BTreeMap<Coordinates, Resolved> = BTreeMap::new();
+        for (module, selection) in self.selected.clone() {
+            let mut coordinates = coordinates_of(&module, &selection.version);
+            let mut extension = None;
+            let mut platform = false;
+            for _ in 0..MAX_RELOCATIONS {
+                let Some(metadata) = self.metadata(&coordinates) else {
+                    break;
                 };
-                let packaging = self
-                    .models
+                let Ok(selected) = metadata.select() else {
+                    break;
+                };
+                // A redirect is checked before anything else, because the
+                // metadata format forbids a redirecting variant from carrying
+                // files: its files are the target's, so an empty `files` here
+                // says nothing about whether there is an artifact to ship.
+                if let Some(target) = redirect_of(&metadata, &coordinates) {
+                    coordinates = target;
+                    continue;
+                }
+                // A variant that ships no files and points nowhere is a
+                // platform or a documentation bundle, so there is nothing to
+                // put in an APK.
+                if !selected.ships_files() {
+                    platform = true;
+                    break;
+                }
+                extension = gmm::library_extension(&selected.attributes)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        selected
+                            .files
+                            .iter()
+                            .find_map(|file| file.extension())
+                            .map(str::to_owned)
+                    });
+                break;
+            }
+            if platform {
+                continue;
+            }
+            let packaging = if extension.is_some() {
+                "aar".to_owned()
+            } else {
+                self.models
                     .get(&coordinates)
-                    .map_or_else(|| "jar".to_owned(), |model| model.packaging.clone());
-                (packaging != "pom").then_some(Resolved {
-                    coordinates,
-                    packaging,
-                })
+                    .map_or_else(|| "jar".to_owned(), |model| model.packaging.clone())
+            };
+            if packaging == "pom" {
+                continue;
+            }
+            out.entry(coordinates.clone()).or_insert_with(|| Resolved {
+                coordinates,
+                packaging,
+                extension,
+            });
+        }
+        out.into_values().collect()
+    }
+
+    /// What a module declares, paired with the version `dependencyManagement`
+    /// pins for it. Each element is `(declaration, kind)`.
+    fn declarations(
+        &mut self,
+        coordinates: &Coordinates,
+    ) -> Result<Vec<(Declaration, Claim)>, NdkError> {
+        if self.metadata(coordinates).is_some() {
+            return Ok(self.metadata_declarations(coordinates));
+        }
+        let module = ModuleId::new(&coordinates.group, &coordinates.artifact);
+        let model = self.model(&module, &coordinates.version)?;
+        Ok(model
+            .dependencies
+            .iter()
+            .map(|declaration| {
+                let claim = model
+                    .management
+                    .get(&declaration.module)
+                    .map(|managed| Claim::Version(managed.version.clone()))
+                    .unwrap_or(Claim::Undeclared);
+                (declaration.clone(), claim)
             })
-            .collect()
+            .collect())
+    }
+
+    /// The runtime variant's dependencies, plus the constraints it publishes.
+    fn metadata_declarations(&mut self, coordinates: &Coordinates) -> Vec<(Declaration, Claim)> {
+        let Some(module) = self.metadata(coordinates) else {
+            return Vec::new();
+        };
+        // A variant that redirects carries no dependencies of its own, so the
+        // module it points at is what actually declares them.
+        if let Some(redirect) = redirect_of(&module, coordinates) {
+            log::debug!(
+                "{} redirects to {}; reading its dependencies there",
+                coordinates.gav(),
+                redirect.gav()
+            );
+            return self.declarations(&redirect).unwrap_or_default();
+        }
+        let selected = match module.select() {
+            Ok(selected) => selected,
+            Err(reason) => {
+                log::warn!("{}: {reason}; using its POM instead", coordinates.gav());
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for dependency in &selected.dependencies {
+            if let Some(constraint) = &dependency.version
+                && !constraint.rejects.is_empty()
+            {
+                log::warn!(
+                    "{} rejects {}:{} but rejections are not enforced",
+                    coordinates.gav(),
+                    dependency.group,
+                    dependency.module
+                );
+            }
+            out.push((
+                Declaration {
+                    module: ModuleId::new(&dependency.group, &dependency.module),
+                    version: dependency
+                        .version
+                        .as_ref()
+                        .and_then(|c| c.requirement().map(str::to_owned)),
+                    scope: Scope::Compile,
+                    optional: false,
+                    exclusions: dependency
+                        .excludes
+                        .iter()
+                        .map(|e| Exclusion {
+                            group: e.group.clone(),
+                            artifact: e.module.clone(),
+                        })
+                        .collect(),
+                },
+                Claim::Declared,
+            ));
+        }
+        for constraint in &selected.dependency_constraints {
+            out.push((
+                Declaration {
+                    module: ModuleId::new(&constraint.group, &constraint.module),
+                    version: constraint
+                        .version
+                        .as_ref()
+                        .and_then(|c| c.requirement().map(str::to_owned)),
+                    scope: Scope::Compile,
+                    optional: false,
+                    exclusions: Vec::new(),
+                },
+                // Version advice, not a dependency. A platform's constraint
+                // list names every version it coordinates, most of which the
+                // consumer never asked for, so following one as a dependency
+                // would add Compose, test fixtures and `guava` to an APK that
+                // uses none of them.
+                Claim::Constraint,
+            ));
+        }
+        out
+    }
+
+    /// Fetches and parses a module's Gradle Module Metadata, if it publishes
+    /// any. Gradle ignores the POM when a `.module` file is present, so this is
+    /// checked first and the POM is only a fallback.
+    fn metadata(&mut self, coordinates: &Coordinates) -> Option<gmm::Module> {
+        if let Some(cached) = self.metadata.get(coordinates) {
+            return cached.clone();
+        }
+        // A module that publishes no `.module` is the common case on Maven
+        // Central, so a missing one is not a failure.
+        let path = maven::fetch_artifact_inner(
+            &maven::artifact_dir(coordinates),
+            &coordinates.group,
+            &coordinates.artifact,
+            &coordinates.version,
+            "module",
+            true,
+        )
+        .ok()
+        .flatten()?;
+        let json = match std::fs::read_to_string(&path) {
+            Ok(json) => json,
+            Err(e) => {
+                log::warn!("cannot read metadata for {}: {e}", coordinates.gav());
+                return None;
+            }
+        };
+        let module = match serde_json::from_str::<gmm::Module>(&json) {
+            Ok(module) => module,
+            Err(e) => {
+                log::warn!("cannot parse metadata for {}: {e}", coordinates.gav());
+                return None;
+            }
+        };
+        self.metadata
+            .insert(coordinates.clone(), Some(module.clone()));
+        Some(module)
     }
 
     /// Fetches and parses a POM, once.
@@ -1212,7 +1481,7 @@ mod tests {
         resolver
     }
 
-    fn resolve_with(resolver: &mut Resolver, roots: &[(&str, &str, &str)]) -> Vec<String> {
+    fn seed_roots(resolver: &mut Resolver, roots: &[(&str, &str, &str)]) {
         for (group, artifact, version) in roots {
             resolver
                 .consider(
@@ -1221,15 +1490,22 @@ mod tests {
                     0,
                     Vec::new(),
                     true,
+                    false,
                 )
                 .expect("root resolves");
         }
+    }
+
+    fn resolve_with(resolver: &mut Resolver, roots: &[(&str, &str, &str)]) -> Vec<String> {
+        seed_roots(resolver, roots);
         resolver.walk();
-        resolver
+        let mut gavs: Vec<String> = resolver
             .results()
             .iter()
             .map(|r| r.coordinates.gav())
-            .collect()
+            .collect();
+        gavs.sort();
+        gavs
     }
 
     #[test]
@@ -1749,6 +2025,237 @@ mod tests {
         ]);
         let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
         assert_eq!(resolved, ["g:b:7.0", "g:root:1.0"]);
+    }
+
+    /// A resolver whose POMs and Gradle Module Metadata are both supplied, for
+    /// the cases where the two disagree.
+    fn offline_with_gmm(
+        poms: &[(&str, &str, &str, String)],
+        modules: &[(&str, &str, &str, &str)],
+    ) -> Resolver {
+        let mut resolver = offline(poms);
+        for (group, artifact, version, json) in modules {
+            let coordinates = Coordinates {
+                group: (*group).to_owned(),
+                artifact: (*artifact).to_owned(),
+                version: (*version).to_owned(),
+            };
+            let parsed: gmm::Module = serde_json::from_str(json).expect("fixture metadata parses");
+            resolver.metadata.insert(coordinates, Some(parsed));
+        }
+        resolver
+    }
+
+    /// A module file whose runtime variant names `depends` and ships one jar.
+    fn gmm_with(group: &str, artifact: &str, depends: &str) -> String {
+        format!(
+            r#"{{
+                 "formatVersion": "1.1",
+                 "component": {{"group":"{group}","module":"{artifact}","version":"1.0"}},
+                 "variants": [
+                   {{
+                     "name": "runtimeElements",
+                     "attributes": {{
+                       "org.gradle.category": "library",
+                       "org.gradle.usage": "java-runtime",
+                       "org.gradle.libraryelements": "aar"
+                     }},
+                     "files": [{{"name":"x.aar","url":"x.aar","size":1,"sha1":"ab"}}],
+                     "dependencies": [{depends}]
+                   }}
+                 ]
+               }}"#
+        )
+    }
+
+    #[test]
+    fn a_dependency_constraint_does_not_pull_the_module_into_the_closure() {
+        // A platform's constraint list names every version it coordinates, most
+        // of which the consumer never asked for. Following one as a dependency
+        // adds Compose, test fixtures and `guava` to an APK using none of them.
+        let mut resolver = offline_with_gmm(
+            &[("g", "root", "1.0", leaf())],
+            &[(
+                "g",
+                "root",
+                "1.0",
+                r#"{
+                     "formatVersion": "1.1",
+                     "variants": [
+                       {
+                         "name": "platformRuntimeElements",
+                         "attributes": {
+                           "org.gradle.category": "platform",
+                           "org.gradle.usage": "java-runtime"
+                         },
+                         "dependencyConstraints": [
+                           {"group":"g","module":"advised","version":{"requires":"4.0"}}
+                         ]
+                       }
+                     ]
+                   }"#,
+            )],
+        );
+        let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
+        assert_eq!(resolved, ["g:root:1.0"]);
+    }
+
+    #[test]
+    fn a_dependency_constraint_still_raises_a_version_something_else_wanted() {
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "g",
+                    "root",
+                    "1.0",
+                    pom(
+                        r#"<groupId>g</groupId><artifactId>root</artifactId><version>1.0</version>
+                           <dependencies>
+                             <dependency><groupId>g</groupId><artifactId>b</artifactId><version>1.0</version></dependency>
+                           </dependencies>"#,
+                    ),
+                ),
+                ("g", "b", "1.0", leaf()),
+                ("g", "b", "4.0", leaf()),
+            ],
+            &[],
+        );
+        // Advice recorded before anything wants the module, then applied when
+        // the module does turn up.
+        resolver
+            .constrained
+            .insert(ModuleId::new("g", "b"), "4.0".to_owned());
+        let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
+        assert!(resolved.contains(&"g:b:4.0".to_owned()), "{resolved:?}");
+    }
+
+    /// A module file whose runtime variant redirects to another module.
+    fn gmm_redirect(target: &str) -> String {
+        format!(
+            r#"{{
+                 "formatVersion": "1.1",
+                 "variants": [
+                   {{
+                     "name": "runtimeElements",
+                     "attributes": {{
+                       "org.gradle.category": "library",
+                       "org.gradle.usage": "java-runtime",
+                       "org.gradle.libraryelements": "jar"
+                     }},
+                     "available-at": {{
+                       "url": "../{target}/{target}.module",
+                       "group": "g",
+                       "module": "{target}",
+                       "version": ""
+                     }}
+                   }}
+                 ]
+               }}"#
+        )
+    }
+
+    #[test]
+    fn a_redirect_fetches_the_target_without_letting_two_versions_ship() {
+        // `androidx.annotation:annotation` publishes a stub jar of its own and
+        // points its JVM variants at `annotation-jvm`. The graph must still
+        // record one module with one version, and the artifact fetched is the
+        // target's.
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "g",
+                    "root",
+                    "1.0",
+                    pom(
+                        r#"<groupId>g</groupId><artifactId>root</artifactId><version>1.0</version>
+                           <dependencies>
+                             <dependency><groupId>g</groupId><artifactId>wanted</artifactId><version>1.0</version></dependency>
+                             <dependency><groupId>g</groupId><artifactId>other</artifactId><version>1.0</version></dependency>
+                           </dependencies>"#,
+                    ),
+                ),
+                ("g", "other", "1.0", leaf()),
+                ("g", "wanted", "1.0", leaf()),
+                ("g", "wanted", "1.6.0", leaf()),
+            ],
+            &[
+                (
+                    "g",
+                    "other",
+                    "1.0",
+                    &gmm_with(
+                        "g",
+                        "other",
+                        r#"{"group":"g","module":"wanted","version":{"requires":"1.6.0"}}"#,
+                    ),
+                ),
+                ("g", "wanted", "1.0", &gmm_redirect("wanted-jvm")),
+                ("g", "wanted", "1.6.0", &gmm_redirect("wanted-jvm")),
+                ("g", "wanted-jvm", "1.0", &gmm_with("g", "wanted-jvm", "")),
+                ("g", "wanted-jvm", "1.6.0", &gmm_with("g", "wanted-jvm", "")),
+            ],
+        );
+        seed_roots(&mut resolver, &[("g", "root", "1.0")]);
+        resolver.walk();
+        let resolved = resolver.results();
+
+        // One artifact, at the newest version, under the target's coordinates.
+        let wanted: Vec<&Resolved> = resolved
+            .iter()
+            .filter(|r| {
+                r.coordinates.artifact == "wanted" || r.coordinates.artifact == "wanted-jvm"
+            })
+            .collect();
+        assert_eq!(wanted.len(), 1, "{resolved:?}");
+        assert_eq!(wanted[0].coordinates.gav(), "g:wanted-jvm:1.6.0");
+        assert_eq!(wanted[0].extension.as_deref(), Some("aar"));
+        // And the redirecting module's own coordinates are not fetched, which
+        // is what keeps a stub jar off the classpath.
+        assert!(
+            !resolved
+                .iter()
+                .any(|r| r.coordinates.gav() == "g:wanted:1.6.0"),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn a_variant_with_no_files_is_left_out_of_the_closure() {
+        let mut resolver = offline_with_gmm(
+            &[("g", "root", "1.0", leaf())],
+            &[(
+                "g",
+                "root",
+                "1.0",
+                r#"{
+                     "formatVersion": "1.1",
+                     "variants": [
+                       {
+                         "name": "platformRuntimeElements",
+                         "attributes": {
+                           "org.gradle.category": "platform",
+                           "org.gradle.usage": "java-runtime"
+                         },
+                         "dependencyConstraints": [
+                           {"group":"g","module":"advised","version":{"requires":"1.0"}}
+                         ]
+                       },
+                       {
+                         "name": "runtimeElements",
+                         "attributes": {
+                           "org.gradle.category": "library",
+                           "org.gradle.usage": "java-runtime",
+                           "org.gradle.libraryelements": "aar"
+                         },
+                         "files": [{"name":"x.aar","url":"x.aar","size":1,"sha1":"ab"}]
+                       }
+                     ]
+                   }"#,
+            )],
+        );
+        let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
+        assert_eq!(resolved, ["g:root:1.0"]);
+        assert!(resolver.results().first().unwrap().extension.is_some());
     }
 
     #[test]

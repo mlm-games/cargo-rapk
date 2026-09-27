@@ -236,7 +236,7 @@ pub fn resolve_libs(gavs: &[String]) -> Result<Vec<ResolvedLib>, NdkError> {
         .collect::<Result<Vec<_>, _>>()?;
     crate::pom::resolve(&roots)?
         .iter()
-        .map(|resolved| ensure_lib(&resolved.coordinates.gav()))
+        .map(|resolved| ensure_lib_as(&resolved.coordinates.gav(), resolved.extension.as_deref()))
         .collect()
 }
 
@@ -556,6 +556,15 @@ fn read_resolved(dir: &Path, coordinates: Coordinates) -> Option<ResolvedLib> {
 /// This fetches one artifact. Use [`resolve_libs`] to walk the dependency graph
 /// as well.
 pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
+    ensure_lib_as(gav, None)
+}
+
+/// As [`ensure_lib`], but fetching `extension` when the module's metadata named
+/// one. A POM can only say "aar or jar", so `None` probes for an AAR first and
+/// then a jar; Gradle Module Metadata says which, and taking it is what keeps a
+/// stub jar published under a multiplatform module's own coordinates off the
+/// classpath.
+pub fn ensure_lib_as(gav: &str, extension: Option<&str>) -> Result<ResolvedLib, NdkError> {
     let coordinates = Coordinates::parse(gav).map_err(|reason| NdkError::MavenLibFailed {
         gav: gav.to_owned(),
         reason,
@@ -583,16 +592,20 @@ pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
         )));
     }
 
+    let wanted = extension.unwrap_or("aar");
     let (archive, is_aar): (Option<PathBuf>, bool) = match fetch_artifact(
         &dir,
         &coordinates.group,
         &coordinates.artifact,
         &coordinates.version,
-        "aar",
+        wanted,
     ) {
-        Ok(found) => (found, true),
-        Err(aar_err) => {
-            // Not every Maven artifact ships an AAR; pure-JVM libraries are jars.
+        Ok(found) => (found, wanted == "aar"),
+        Err(first_err) => {
+            // A POM names no archive, so a jar is tried when no AAR answers.
+            if wanted == "jar" {
+                return Err(fail(first_err));
+            }
             match fetch_artifact(
                 &dir,
                 &coordinates.group,
@@ -601,7 +614,7 @@ pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
                 "jar",
             ) {
                 Ok(found) => (found, false),
-                _ => return Err(fail(aar_err)),
+                _ => return Err(fail(first_err)),
             }
         }
     };

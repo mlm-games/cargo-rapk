@@ -823,6 +823,7 @@ dependencies = [
  "log",
  "quick-xml",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "time",
  "toml 1.1.6+spec-1.1.0",
