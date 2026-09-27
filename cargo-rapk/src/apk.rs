@@ -1,7 +1,8 @@
 use crate::contrib::collect_android_contributions;
 use crate::error::Error;
 use crate::java::{
-    collect_jar_files, collect_java_files, collect_kotlin_files, compile_java_sources,
+    DexInputs, collect_jar_files, collect_java_files, collect_kotlin_files, compile_java_sources,
+    compile_r_java,
 };
 use crate::manifest::{Inheritable, Manifest, Root};
 use cargo_subcommand::{Artifact, ArtifactType, CrateType, Profile, Subcommand};
@@ -333,7 +334,15 @@ impl<'a> ApkBuilder<'a> {
             }
             let libs = self.android_libs()?;
             if !libs.is_empty() {
-                line.push_str(&format!(", {} android_libs", libs.len()));
+                let with_res = libs
+                    .iter()
+                    .filter_map(|lib| rndk::maven::ensure_lib(lib).ok())
+                    .filter(|lib| lib.resources.is_some())
+                    .count();
+                line.push_str(&format!(
+                    ", {} android_libs ({with_res} with resources)",
+                    libs.len()
+                ));
             }
             println!("{line}");
             return Ok(());
@@ -498,11 +507,36 @@ impl<'a> ApkBuilder<'a> {
             .map(|p| dunce::simplified(&crate_path.join(p)).to_owned());
         let android_libs = self.android_libs()?;
         let mut lib_jars = Vec::new();
+        let mut library_resources = Vec::new();
+        let mut library_manifests = Vec::new();
+        let mut r_libraries = Vec::new();
         for lib in &android_libs {
-            lib_jars.extend(rndk::maven::ensure_lib(lib)?.jars);
+            let resolved = rndk::maven::ensure_lib(lib)?;
+            lib_jars.extend(resolved.jars.iter().cloned());
+            if let Some(res) = &resolved.resources {
+                library_resources.push(res.clone());
+            }
+            // `R` generation needs a package, so a library that ships
+            // resources always takes this path; a library that only declares
+            // components is merged into the manifest directly.
+            match (resolved.resources.is_some(), resolved.package) {
+                (true, Some(package)) => {
+                    r_libraries.push((package, resolved.manifest.unwrap_or_default()))
+                }
+                // A jar with no AAR manifest has nothing to merge, and an AAR
+                // without a `package` cannot be given an `R` class.
+                (false, _) => library_manifests.extend(resolved.manifest),
+                (true, None) => {}
+            }
         }
         lib_jars.sort();
         lib_jars.dedup();
+        library_resources.sort();
+        library_resources.dedup();
+        library_manifests.sort();
+        library_manifests.dedup();
+        r_libraries.sort();
+        r_libraries.dedup();
 
         if !java_sources.is_empty() || !lib_jars.is_empty() {
             manifest.application.has_code = true;
@@ -524,6 +558,8 @@ impl<'a> ApkBuilder<'a> {
             apk_name,
             assets,
             resources,
+            library_resources,
+            library_manifests,
             manifest,
             disable_aapt_compression,
             strip: self.manifest.strip,
@@ -535,11 +571,45 @@ impl<'a> ApkBuilder<'a> {
         };
         let mut apk = config.create_apk()?;
 
-        if !java_sources.is_empty() || !lib_jars.is_empty() {
+        // A library's `R` class has to be generated from the same overlays the
+        // app is linked against, so this reuses the compiled tree `create_apk`
+        // already produced.
+        let mut r_classes = Vec::new();
+        let mut extra_classpath = Vec::new();
+        if !r_libraries.is_empty() {
+            let overlays = config.compiled_overlays()?;
+            let r_dir = config.build_dir.join("lib_r");
+            let r_java = rndk::maven::generate_library_r(
+                &self.ndk,
+                &overlays,
+                &r_libraries,
+                self.min_sdk_version(),
+                target_sdk_version,
+                &r_dir,
+            )?;
+            let r_class_dir = r_dir.join("classes");
+            r_classes = compile_r_java(
+                &self.ndk,
+                &r_java,
+                &lib_jars,
+                &r_class_dir,
+                &config.build_dir,
+            )?;
+            // The generated `R` classes have to be on the classpath the app's
+            // own sources compile against, or `androidx.appcompat.R.id.x` does
+            // not resolve.
+            extra_classpath.push(r_class_dir);
+        }
+
+        if !java_sources.is_empty() || !lib_jars.is_empty() || !r_classes.is_empty() {
             let dex_files = compile_java_sources(
                 &self.ndk,
                 java_sources.as_slice(),
-                lib_jars.as_slice(),
+                DexInputs {
+                    lib_jars: lib_jars.as_slice(),
+                    classes: r_classes.as_slice(),
+                    classpath: extra_classpath.as_slice(),
+                },
                 &config.build_dir,
                 self.min_sdk_version(),
                 target_sdk_version,

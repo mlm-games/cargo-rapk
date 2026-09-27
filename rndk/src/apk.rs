@@ -24,6 +24,34 @@ pub enum BuildFormat {
 /// `uid / PER_USER_RANGE` is the user id.
 const PER_USER_RANGE: u32 = 100_000;
 
+/// Collects the compiled `.flat` overlays, grouped by the source index they
+/// were compiled from and in directory order. Later groups override earlier
+/// ones, so the order is what decides precedence and cannot be sorted away.
+fn read_overlays(compiled: &Path) -> Result<Vec<PathBuf>, NdkError> {
+    let mut groups: Vec<(u64, Vec<PathBuf>)> = Vec::new();
+    for entry in fs::read_dir(compiled)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let index = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        let mut flats: Vec<PathBuf> = fs::read_dir(&path)?
+            .filter_map(|f| f.ok())
+            .map(|f| f.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "flat"))
+            .collect();
+        flats.sort();
+        groups.push((index, flats));
+    }
+    groups.sort_by_key(|(index, _)| *index);
+    Ok(groups.into_iter().flat_map(|(_, flats)| flats).collect())
+}
+
 /// `fs::copy` also copies permission bits, which makes a rebuild fail when the
 /// source is read-only (a read-only SDK in `/nix/store`, for example).
 fn set_readable(path: &Path) -> Result<(), NdkError> {
@@ -71,6 +99,11 @@ pub struct ApkConfig {
     pub assets: Option<PathBuf>,
     pub resources: Option<PathBuf>,
     pub manifest: AndroidManifest,
+    /// Resource trees contributed by `android_libs`, compiled as overlays
+    /// alongside the app's own.
+    pub library_resources: Vec<PathBuf>,
+    /// `android_libs` manifests, folded into `manifest` before it is written.
+    pub library_manifests: Vec<String>,
     pub disable_aapt_compression: bool,
     pub strip: StripConfig,
     pub reverse_port_forward: HashMap<String, String>,
@@ -122,9 +155,20 @@ impl ApkConfig {
         }
     }
 
+    /// Folds every library manifest into the app's, then writes it.
+    fn write_merged_manifest(&self) -> Result<(), NdkError> {
+        let mut manifest = self.manifest.clone();
+        for library in &self.library_manifests {
+            let library: AndroidManifest = quick_xml::de::from_str(library)
+                .map_err(|e| NdkError::LibraryManifestInvalid(e.to_string()))?;
+            manifest.merge_library(&library, &self.manifest.package);
+        }
+        manifest.write_to(&self.build_dir)
+    }
+
     fn create_apk_impl(&self) -> Result<UnalignedApk<'_>, NdkError> {
         std::fs::create_dir_all(&self.build_dir)?;
-        self.manifest.write_to(&self.build_dir)?;
+        self.write_merged_manifest()?;
 
         let target_sdk_version = self
             .manifest
@@ -132,30 +176,33 @@ impl ApkConfig {
             .target_sdk_version
             .unwrap_or_else(|| self.ndk.default_target_platform());
 
-        let mut aapt = self.build_tool("aapt")?;
-        aapt.arg("package")
-            .arg("-f")
-            .arg("-F")
+        let mut aapt2 = self.build_tool("aapt2")?;
+        aapt2
+            .arg("link")
+            .arg("-o")
             .arg(self.unaligned_apk())
-            .arg("-M")
-            .arg("AndroidManifest.xml")
             .arg("-I")
-            .arg(self.ndk.android_jar(target_sdk_version)?);
+            .arg(self.ndk.android_jar(target_sdk_version)?)
+            .arg("--manifest")
+            .arg(self.build_dir.join("AndroidManifest.xml"))
+            // Library overlays introduce resources the app manifest does not
+            // declare, so they are added rather than treated as conflicts.
+            .arg("--auto-add-overlay");
 
         if self.disable_aapt_compression {
-            aapt.arg("-0").arg("");
+            aapt2.arg("--no-compress");
         }
 
-        if let Some(res) = &self.resources {
-            aapt.arg("-S").arg(res);
+        for flat in self.compile_resources()? {
+            aapt2.arg("-R").arg(flat);
         }
 
         if let Some(assets) = &self.assets {
-            aapt.arg("-A").arg(assets);
+            aapt2.arg("-A").arg(assets);
         }
 
-        if !aapt.status()?.success() {
-            return Err(NdkError::CmdFailed(Box::new(aapt)));
+        if !aapt2.status()?.success() {
+            return Err(NdkError::CmdFailed(Box::new(aapt2)));
         }
 
         Ok(UnalignedApk {
@@ -164,9 +211,70 @@ impl ApkConfig {
         })
     }
 
+    /// The compiled `.flat` overlays from the last [`Self::compile_resources`]
+    /// call, in the same order, so a later step can generate `R` classes from
+    /// the identical table.
+    pub fn compiled_overlays(&self) -> Result<Vec<PathBuf>, NdkError> {
+        let compiled = self.build_dir.join("compiled_res");
+        if !compiled.is_dir() {
+            return Ok(Vec::new());
+        }
+        read_overlays(&compiled)
+    }
+
+    /// Compiles every resource tree (the app's own, then each library's) into
+    /// `.flat` overlays, in a stable order. Returns an empty list when there is
+    /// nothing to compile.
+    pub(crate) fn compile_resources(&self) -> Result<Vec<PathBuf>, NdkError> {
+        let compiled = self.build_dir.join("compiled_res");
+        if compiled.exists() {
+            fs::remove_dir_all(&compiled)?;
+        }
+        if self.resources.is_none() && self.library_resources.is_empty() {
+            return Ok(Vec::new());
+        }
+        fs::create_dir_all(&compiled)?;
+
+        // Later overlays win, so libraries are linked first and the app's own
+        // tree last: an app that redefines a library resource keeps its value.
+        let mut sources: Vec<PathBuf> = Vec::new();
+        // An AAR's tree is extracted to `<dir>/res/res/`, so aapt2 gets the
+        // inner directory that actually holds `values/`, `layout/`, …
+        for library in &self.library_resources {
+            let inner = library.join("res");
+            sources.push(if inner.is_dir() {
+                inner
+            } else {
+                library.clone()
+            });
+        }
+        if let Some(res) = &self.resources {
+            sources.push(res.clone());
+        }
+
+        for (index, source) in sources.iter().enumerate() {
+            if !source.is_dir() {
+                return Err(NdkError::PathNotFound(source.clone()));
+            }
+            let out = compiled.join(index.to_string());
+            fs::create_dir_all(&out)?;
+            let mut compile = self.build_tool("aapt2")?;
+            compile
+                .arg("compile")
+                .arg("-o")
+                .arg(&out)
+                .arg("--dir")
+                .arg(source);
+            if !compile.status()?.success() {
+                return Err(NdkError::CmdFailed(Box::new(compile)));
+            }
+        }
+        read_overlays(&compiled)
+    }
+
     fn create_aab_impl(&self) -> Result<UnalignedApk<'_>, NdkError> {
         std::fs::create_dir_all(&self.build_dir)?;
-        self.manifest.write_to(&self.build_dir)?;
+        self.write_merged_manifest()?;
 
         let target_sdk_version = self
             .manifest
@@ -183,27 +291,11 @@ impl ApkConfig {
             .arg("-I")
             .arg(self.ndk.android_jar(target_sdk_version)?)
             .arg("--manifest")
-            .arg(self.build_dir.join("AndroidManifest.xml"));
+            .arg(self.build_dir.join("AndroidManifest.xml"))
+            .arg("--auto-add-overlay");
 
-        if let Some(res) = &self.resources {
-            let compiled = self.build_dir.join("compiled_res");
-            fs::create_dir_all(&compiled)?;
-            let mut compile = self.build_tool("aapt2")?;
-            compile
-                .arg("compile")
-                .arg("-o")
-                .arg(&compiled)
-                .arg("--dir")
-                .arg(res);
-            if !compile.status()?.success() {
-                return Err(NdkError::CmdFailed(Box::new(compile)));
-            }
-            for entry in fs::read_dir(&compiled)? {
-                let entry = entry?;
-                if entry.path().extension().is_some_and(|e| e == "flat") {
-                    aapt2.arg("-R").arg(entry.path());
-                }
-            }
+        for flat in self.compile_resources()? {
+            aapt2.arg("-R").arg(flat);
         }
 
         if let Some(assets) = &self.assets {

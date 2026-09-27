@@ -129,12 +129,17 @@ exported = false
 # `$XDG_CACHE_HOME/cargo-rapk/maven/<group>/<artifact>/<version>`; pins are
 # `CARGO_RAPK_FETCH_MAVEN=never|force` and `CARGO_RAPK_NO_FETCH_MAVEN=1`.
 #
-# Only pure class containers are accepted. An AAR that ships `res/` or
-# contributes `<uses-permission>`, `<provider>`, `<service>`, … to the manifest
-# is rejected at preflight, because merging those needs the resource and
-# manifest mergers that only the Android Gradle plugin provides — silently
-# dropping them yields an app that crashes on device instead of at build time.
-# No transitive resolution: list every artifact you need explicitly.
+# An AAR's `res/` is compiled with `aapt2` and linked as an overlay alongside
+# the app's own `resources`, and its `AndroidManifest.xml` is merged in
+# (permissions, `meta-data` and `provider`; its `package`, version, icon, label
+# and theme are dropped, as those belong to the app). A per-library `R` class is
+# generated from the same overlay set, so `androidx.appcompat.R.id.x` resolves
+# and the ids match the shipped table.
+#
+# No transitive resolution: list every artifact you need explicitly. An AAR that
+# depends on others (`GameActivity` needs `appcompat`) will fail to link until
+# its dependencies are listed too; a Gradle build is the better route for a
+# large dependency graph.
 # `android_libs = ["org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"]
 android_libs = "org.example:some-library:1.2.3"
 

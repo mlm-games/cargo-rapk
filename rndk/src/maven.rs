@@ -10,8 +10,10 @@
 //! without touching the network again.
 
 use crate::error::NdkError;
+use crate::ndk::Ndk;
 use std::{
     collections::BTreeSet,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -211,12 +213,18 @@ impl Coordinates {
     }
 }
 
-/// A resolved Android library: the jars that go on the compile classpath and
-/// into the dex.
+/// A resolved Android library.
 #[derive(Debug, Clone)]
 pub struct ResolvedLib {
     pub coordinates: Coordinates,
     pub jars: Vec<PathBuf>,
+    /// The AAR's `res/` tree, if it has one. This is the extraction root; the
+    /// tree aapt2 compiles is its `res` child.
+    pub resources: Option<PathBuf>,
+    /// The library's own `package`, which its `R` class is generated under.
+    pub package: Option<String>,
+    /// `AndroidManifest.xml`, if the AAR carries one.
+    pub manifest: Option<String>,
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -249,10 +257,25 @@ fn fetch_forced() -> bool {
     std::env::var("CARGO_RAPK_FETCH_MAVEN").is_ok_and(|v| v.trim().eq_ignore_ascii_case("force"))
 }
 
+fn manifest_package(xml: &str) -> Option<String> {
+    let open = xml.find("<manifest")?;
+    let tag = &xml[open..];
+    let end = tag.find('>')?;
+    let attr = tag[..end].find("package=")? + "package=".len();
+    let rest = &tag[attr..];
+    let quote = rest.chars().next()?;
+    if !matches!(quote, '"' | '\'') {
+        return None;
+    }
+    rest[1..]
+        .find(quote)
+        .map(|end| rest[1..1 + end].to_string())
+}
+
 /// Element names an AAR manifest contributes to the merged manifest. Anything
 /// but these two is dropped by the packaging pipeline, and a dropped provider or
 /// activity only shows up as a crash on device.
-fn manifest_contributions(xml: &str) -> Result<BTreeSet<String>, quick_xml::Error> {
+pub(crate) fn manifest_contributions(xml: &str) -> Result<BTreeSet<String>, quick_xml::Error> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -272,17 +295,113 @@ fn manifest_contributions(xml: &str) -> Result<BTreeSet<String>, quick_xml::Erro
     Ok(found)
 }
 
-fn res_entries(archive: &mut zip::ZipArchive<std::fs::File>) -> Vec<String> {
-    let mut names = Vec::new();
+/// Extracts an AAR's `res/` tree. Entry names are checked by the zip reader, so
+/// a `../` path cannot escape `dest`.
+fn extract_res(archive_path: &Path, dest: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("not a valid archive: {e}"))?;
     for i in 0..archive.len() {
-        if let Ok(entry) = archive.by_index(i)
-            && !entry.is_dir()
-            && entry.name().starts_with("res/")
-        {
-            names.push(entry.name().to_owned());
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("unreadable archive entry: {e}"))?;
+        let name = entry.name().to_owned();
+        let Some(relative) = name.strip_prefix("res/") else {
+            continue;
+        };
+        let Some(out_path) = entry.enclosed_name().map(|p| dest.join(p)) else {
+            continue;
+        };
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            continue;
         }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        let _ = relative;
     }
-    names
+    Ok(())
+}
+
+/// Generates one `R.java` per library against the shared resource table.
+///
+/// This has to run *after* the app's own `aapt2 link`, over the same compiled
+/// overlays: a `--static-lib` link would emit placeholder ids (`0x0`) and
+/// library code would then fail at runtime with "The key must be an
+/// application-specific resource id".
+pub fn generate_library_r(
+    ndk: &Ndk,
+    overlays: &[PathBuf],
+    libraries: &[(String, String)],
+    min_sdk_version: u32,
+    target_sdk_version: u32,
+    out_dir: &Path,
+) -> Result<Vec<PathBuf>, NdkError> {
+    if libraries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if overlays.is_empty() {
+        return Err(NdkError::MavenLibFailed {
+            gav: libraries.len().to_string(),
+            reason: "library resources requested but no compiled overlays are available".to_owned(),
+        });
+    }
+    let _ = out_dir;
+    let android_jar = ndk.android_jar(target_sdk_version)?;
+
+    let mut generated = Vec::new();
+    for (index, (package, _manifest)) in libraries.iter().enumerate() {
+        let dir = out_dir.join(index.to_string());
+        std::fs::create_dir_all(&dir)?;
+
+        // aapt2 validates the `package` attribute, and only writes below `--java`.
+        let manifest_path = dir.join("AndroidManifest.xml");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                 <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n\
+                 \x20   package=\"{package}\" />\n"
+            ),
+        )?;
+
+        // aapt2 requires an output path; the archive itself is irrelevant here,
+        // only the generated R.java is read back.
+        let out_apk = dir.join("overlay.apk");
+        let mut cmd = ndk.build_tool("aapt2")?;
+        cmd.arg("link")
+            .arg("--java")
+            .arg(&dir)
+            .arg("-o")
+            .arg(&out_apk)
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("-I")
+            .arg(&android_jar)
+            .arg("--auto-add-overlay")
+            .arg("--min-sdk-version")
+            .arg(min_sdk_version.to_string());
+        for overlay in overlays {
+            cmd.arg("-R").arg(overlay);
+        }
+        if !cmd.status()?.success() {
+            return Err(NdkError::CmdFailed(Box::new(cmd)));
+        }
+
+        let r_java = dir.join(package.replace('.', "/")).join("R.java");
+        if !r_java.is_file() {
+            return Err(NdkError::MavenLibFailed {
+                gav: package.clone(),
+                reason: format!("aapt2 generated no R.java at {}", r_java.display()),
+            });
+        }
+        generated.push(r_java);
+    }
+    generated.sort();
+    Ok(generated)
 }
 
 fn extract_lib(archive_path: &Path, dest: &Path, is_aar: bool) -> Result<Vec<PathBuf>, String> {
@@ -330,12 +449,45 @@ fn extract_lib(archive_path: &Path, dest: &Path, is_aar: bool) -> Result<Vec<Pat
     Ok(jars)
 }
 
-/// Fetch (or reuse) one `android_libs` entry and return its jars.
+/// Re-reads an already-extracted library from the cache, so a cached artifact
+/// costs no network access and no re-extraction.
+fn read_resolved(dir: &Path, coordinates: Coordinates) -> Option<ResolvedLib> {
+    let mut jars: Vec<PathBuf> = std::fs::read_dir(dir.join("jars"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jar"))
+        .collect();
+    jars.sort();
+    if jars.is_empty() {
+        return None;
+    }
+    let meta = std::fs::read_to_string(dir.join(".cargo-rapk-lib-meta")).ok()?;
+    let package = meta
+        .lines()
+        .find_map(|l| l.strip_prefix("package=").map(str::to_string))
+        .filter(|p| !p.is_empty());
+    let manifest = meta
+        .lines()
+        .find_map(|l| l.strip_prefix("manifest=").map(str::to_string))
+        .filter(|m| !m.is_empty());
+    let resources = {
+        let res = dir.join("res");
+        res.is_dir().then_some(res)
+    };
+    Some(ResolvedLib {
+        coordinates,
+        jars,
+        resources,
+        package,
+        manifest,
+    })
+}
+
+/// Fetches (or reuses) one `android_libs` entry: its jars, `res/` tree and
+/// manifest, all cached under the artifact directory.
 ///
-/// Only artifacts that are pure class containers are accepted: an AAR carrying
-/// `res/` or manifest entries needs a resource/manifest merger, and silently
-/// ignoring them would produce an app that fails at runtime instead of at build
-/// time. Use Gradle for those.
+/// Nothing is resolved transitively; every artifact has to be listed.
 pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
     let coordinates = Coordinates::parse(gav).map_err(|reason| NdkError::MavenLibFailed {
         gav: gav.to_owned(),
@@ -346,18 +498,9 @@ pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
 
     if !fetch_forced()
         && std::fs::read_to_string(&marker).is_ok_and(|m| m.trim() == coordinates.gav())
+        && let Some(lib) = read_resolved(&dir, coordinates.clone())
     {
-        let mut jars: Vec<PathBuf> = std::fs::read_dir(dir.join("jars"))
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "jar"))
-            .collect();
-        jars.sort();
-        if !jars.is_empty() {
-            return Ok(ResolvedLib { coordinates, jars });
-        }
+        return Ok(lib);
     }
 
     let fail = |reason: String| NdkError::MavenLibFailed {
@@ -404,47 +547,62 @@ pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
 
     let file = std::fs::File::open(&archive).map_err(|e| fail(e.to_string()))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| fail(e.to_string()))?;
-    if is_aar {
-        let res = res_entries(&mut zip);
-        if !res.is_empty() {
-            return Err(fail(format!(
-                "carries {} resource file(s) (e.g. `{}`); library resource merging is not \
-                 supported, use a Gradle build",
-                res.len(),
-                res[0]
-            )));
-        }
-        let mut library_manifest = None;
-        for i in 0..zip.len() {
-            if let Ok(mut entry) = zip.by_index(i)
-                && entry.name() == "AndroidManifest.xml"
-            {
-                use std::io::Read;
-                let mut xml = String::new();
-                entry
-                    .read_to_string(&mut xml)
-                    .map_err(|e| fail(format!("unreadable AndroidManifest.xml: {e}")))?;
-                library_manifest = Some(xml);
-                break;
-            }
-        }
-        if let Some(xml) = library_manifest {
-            let contributions = manifest_contributions(&xml).map_err(|e| fail(e.to_string()))?;
-            if !contributions.is_empty() {
-                return Err(fail(format!(
-                    "declares <{}>; library manifest merging is not supported, use a Gradle build",
-                    contributions.into_iter().collect::<Vec<_>>().join(">, <")
-                )));
-            }
+
+    let mut library_manifest = None;
+    for i in 0..zip.len() {
+        if let Ok(mut entry) = zip.by_index(i)
+            && entry.name() == "AndroidManifest.xml"
+        {
+            use std::io::Read;
+            let mut xml = String::new();
+            entry
+                .read_to_string(&mut xml)
+                .map_err(|e| fail(format!("unreadable AndroidManifest.xml: {e}")))?;
+            library_manifest = Some(xml);
+            break;
         }
     }
+    let package = library_manifest
+        .as_deref()
+        .and_then(manifest_package)
+        .filter(|p| !p.is_empty());
     drop(zip);
 
     let jars_dir = dir.join("jars");
     let _ = std::fs::remove_dir_all(&jars_dir);
     let jars = extract_lib(&archive, &jars_dir, is_aar).map_err(&fail)?;
+
+    let resources = if is_aar {
+        let res_dir = dir.join("res");
+        let _ = fs::remove_dir_all(&res_dir);
+        extract_res(&archive, &res_dir).map_err(&fail)?;
+        res_dir.is_dir().then_some(res_dir)
+    } else {
+        None
+    };
+
+    let manifest = library_manifest.filter(|xml| {
+        manifest_contributions(xml)
+            .map(|c| !c.is_empty())
+            .unwrap_or(true)
+    });
+
+    let mut meta = String::new();
+    if let Some(p) = &package {
+        meta.push_str(&format!("package={p}\n"));
+    }
+    if let Some(m) = &manifest {
+        meta.push_str(&format!("manifest={m}\n"));
+    }
+    std::fs::write(dir.join(".cargo-rapk-lib-meta"), meta).map_err(|e| fail(e.to_string()))?;
     std::fs::write(&marker, coordinates.gav()).map_err(|e| fail(e.to_string()))?;
-    Ok(ResolvedLib { coordinates, jars })
+    Ok(ResolvedLib {
+        coordinates,
+        jars,
+        resources,
+        package,
+        manifest,
+    })
 }
 
 #[cfg(test)]

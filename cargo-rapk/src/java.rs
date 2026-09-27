@@ -104,14 +104,82 @@ fn collect_class_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(class_files)
 }
 
+/// Compiles generated `R.java` sources, returning the class files so they can
+/// be dexed alongside the rest.
+pub(crate) fn compile_r_java(
+    ndk: &Ndk,
+    r_sources: &[PathBuf],
+    classpath_jars: &[PathBuf],
+    out_dir: &Path,
+    build_dir: &Path,
+) -> Result<Vec<PathBuf>, Error> {
+    if r_sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    if out_dir.exists() {
+        fs::remove_dir_all(out_dir)?;
+    }
+    fs::create_dir_all(out_dir)?;
+    let _ = build_dir;
+
+    let path_separator = if cfg!(target_os = "windows") {
+        ';'
+    } else {
+        ':'
+    };
+    let mut classpath = ndk
+        .android_jar(ndk.default_target_platform())?
+        .to_string_lossy()
+        .into_owned();
+    for jar in classpath_jars {
+        classpath.push(path_separator);
+        classpath.push_str(&jar.to_string_lossy());
+    }
+
+    let mut javac = ndk.javac()?;
+    javac
+        .arg("-nowarn")
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("--release")
+        .arg("8")
+        .arg("-proc:none")
+        .arg("-classpath")
+        .arg(&classpath)
+        .arg("-d")
+        .arg(out_dir);
+    for source in r_sources {
+        javac.arg(source);
+    }
+    if !javac.status()?.success() {
+        return Err(NdkError::CmdFailed(Box::new(javac)).into());
+    }
+    collect_class_files(out_dir)
+}
+
+/// Everything the Java/Kotlin/dex stage needs beyond the source directories.
+pub(crate) struct DexInputs<'a> {
+    /// Jars from `android_libs`, on the classpath and dexed.
+    pub lib_jars: &'a [PathBuf],
+    /// Pre-compiled classes (generated `R` classes), on the classpath and dexed.
+    pub classes: &'a [PathBuf],
+    /// Directories added to the classpath only, e.g. the generated `R` output.
+    pub classpath: &'a [PathBuf],
+}
+
 pub(crate) fn compile_java_sources(
     ndk: &Ndk,
     source_dirs: &[PathBuf],
-    lib_jars: &[PathBuf],
+    inputs: DexInputs<'_>,
     build_dir: &Path,
     min_sdk_version: u32,
     target_sdk_version: u32,
 ) -> Result<Vec<PathBuf>, Error> {
+    let DexInputs {
+        lib_jars,
+        classes: extra_classes,
+        classpath: extra_classpath,
+    } = inputs;
     let java_files = collect_java_files(source_dirs)?;
     let kt_files = collect_kotlin_files(source_dirs)?;
     let mut jar_files = collect_jar_files(source_dirs)?;
@@ -121,7 +189,11 @@ pub(crate) fn compile_java_sources(
         }
     }
     jar_files.sort();
-    if java_files.is_empty() && kt_files.is_empty() && jar_files.is_empty() {
+    if java_files.is_empty()
+        && kt_files.is_empty()
+        && jar_files.is_empty()
+        && extra_classes.is_empty()
+    {
         return Ok(Vec::new());
     }
 
@@ -141,9 +213,9 @@ pub(crate) fn compile_java_sources(
         ':'
     };
     let mut classpath = android_jar.to_string_lossy().into_owned();
-    for jar_file in &jar_files {
+    for entry in jar_files.iter().chain(extra_classpath) {
         classpath.push(path_separator);
-        classpath.push_str(&jar_file.to_string_lossy());
+        classpath.push_str(&entry.to_string_lossy());
     }
 
     // `-no-stdlib` is opt-in
@@ -161,6 +233,11 @@ pub(crate) fn compile_java_sources(
             .arg("UTF-8")
             .arg("--release")
             .arg("8")
+            // A jar on the classpath that ships a
+            // `META-INF/services/javax.annotation.processing.Processor` would
+            // otherwise be executed during compilation. Nothing here needs
+            // annotation processing.
+            .arg("-proc:none")
             .arg("-classpath")
             .arg(&classpath)
             .arg("-d")
@@ -201,7 +278,12 @@ pub(crate) fn compile_java_sources(
         }
     }
 
-    let class_files = collect_class_files(&classes_dir)?;
+    let mut class_files = collect_class_files(&classes_dir)?;
+    for extra in extra_classes {
+        class_files.push(extra.clone());
+    }
+    class_files.sort();
+    class_files.dedup();
 
     let mut d8 = ndk.d8()?;
     d8.arg("--lib")

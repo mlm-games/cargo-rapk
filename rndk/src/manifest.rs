@@ -68,6 +68,58 @@ impl AndroidManifest {
         std::fs::write(dir.join("AndroidManifest.xml"), xml.as_bytes())?;
         Ok(())
     }
+
+    /// Folds a library's manifest into this one.
+    ///
+    /// Only the elements whose absence is fatal are merged: components the
+    /// library declares as exported, its permissions, and its `meta-data`. The
+    /// library's own `package`, `versionCode`, icon, label and theme are
+    /// deliberately dropped — those belong to the app, and a library declaring
+    /// them means it was not built for independent merging.
+    pub fn merge_library(&mut self, library: &AndroidManifest, application_id: &str) {
+        for permission in &library.uses_permission {
+            if !self
+                .uses_permission
+                .iter()
+                .any(|p| p.name == permission.name)
+            {
+                self.uses_permission.push(permission.clone());
+            }
+        }
+
+        for meta_data in &library.application.meta_data {
+            if !self
+                .application
+                .meta_data
+                .iter()
+                .any(|m| m.name == meta_data.name)
+            {
+                self.application.meta_data.push(meta_data.clone());
+            }
+        }
+
+        for provider in &library.application.provider {
+            if self
+                .application
+                .provider
+                .iter()
+                .any(|p| p.name == provider.name)
+            {
+                continue;
+            }
+            let mut provider = provider.clone();
+            // A provider declared with `${applicationId}` in its authorities
+            // only resolves once the app id is known.
+            if let Some(authorities) = &provider.authorities {
+                provider.authorities = Some(
+                    authorities
+                        .replace("${applicationId}", application_id)
+                        .replace("${applicationIdSuffix}", ""),
+                );
+            }
+            self.application.provider.push(provider);
+        }
+    }
 }
 
 /// Android [application element](https://developer.android.com/guide/topics/manifest/application-element), containing one or more [`Activity`] and [`Service`] elements.
@@ -132,6 +184,8 @@ pub struct Application {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_receivers")]
     pub receiver: Vec<Receiver>,
+    #[serde(default)]
+    pub provider: Vec<Provider>,
     #[serde(rename(serialize = "profileable"))]
     #[serde(default)]
     pub profileable: Option<Profileable>,
@@ -157,6 +211,7 @@ impl Default for Application {
             activity: default_activities(),
             service: Vec::new(),
             receiver: Vec::new(),
+            provider: Vec::new(),
             profileable: None,
             uses_native_library: Vec::new(),
         }
@@ -610,6 +665,51 @@ pub struct QueryProvider {
     // however this is required for aapt support and should be made optional if/when cargo-rapk migrates to aapt2
     #[serde(rename(serialize = "@android:name"))]
     pub name: String,
+}
+
+/// Android [provider element](https://developer.android.com/guide/topics/manifest/provider-element),
+/// as contributed by library manifests.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Provider {
+    #[serde(rename(serialize = "@android:name"))]
+    pub name: String,
+    #[serde(
+        rename(serialize = "@android:authorities"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub authorities: Option<String>,
+    #[serde(
+        rename(serialize = "@android:exported"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exported: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:enabled"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:initOrder"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub init_order: Option<i32>,
+    #[serde(
+        rename(serialize = "@android:multiprocess"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub multiprocess: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:process"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process: Option<String>,
+    #[serde(
+        rename(serialize = "@android:grantUriPermissions"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub grant_uri_permissions: Option<bool>,
+    #[serde(rename(serialize = "meta-data"), default)]
+    pub meta_data: Vec<MetaData>,
 }
 
 /// Android [queries element](https://developer.android.com/guide/topics/manifest/queries-element).

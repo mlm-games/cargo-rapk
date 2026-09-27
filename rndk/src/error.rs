@@ -77,6 +77,8 @@ pub enum NdkError {
     KotlinJavaMissing(String),
     #[error("Failed to resolve `android_libs` entry `{gav}`: {reason}")]
     MavenLibFailed { gav: String, reason: String },
+    #[error("Failed to parse a library's AndroidManifest.xml: {0}")]
+    LibraryManifestInvalid(String),
     #[error(
         "No key alias configured for `{0}`; set it via `CARGO_RAPK_<PROFILE>_KEYSTORE_ALIAS` or `[package.metadata.android.signing.<profile>] alias` (required for AAB signing)"
     )]
