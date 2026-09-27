@@ -104,6 +104,21 @@ pub struct Application {
         skip_serializing_if = "Option::is_none"
     )]
     pub uses_cleartext_traffic: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:requestLegacyExternalStorage"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_legacy_external_storage: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:allowNativeHeapPointerTagging"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_native_heap_pointer_tagging: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:installLocation"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub install_location: Option<String>,
 
     #[serde(rename(serialize = "meta-data"))]
     #[serde(default)]
@@ -114,6 +129,15 @@ pub struct Application {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_services")]
     pub service: Vec<Service>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_receivers")]
+    pub receiver: Vec<Receiver>,
+    #[serde(rename(serialize = "profileable"))]
+    #[serde(default)]
+    pub profileable: Option<Profileable>,
+    #[serde(rename(serialize = "uses-native-library"))]
+    #[serde(default)]
+    pub uses_native_library: Vec<NativeLibrary>,
 }
 
 impl Default for Application {
@@ -126,9 +150,15 @@ impl Default for Application {
             label: String::new(),
             extract_native_libs: None,
             uses_cleartext_traffic: None,
+            request_legacy_external_storage: None,
+            allow_native_heap_pointer_tagging: None,
+            install_location: None,
             meta_data: Vec::new(),
             activity: default_activities(),
             service: Vec::new(),
+            receiver: Vec::new(),
+            profileable: None,
+            uses_native_library: Vec::new(),
         }
     }
 }
@@ -292,6 +322,94 @@ where
         OneOrMany::One(service) => Ok(vec![service]),
         OneOrMany::Many(services) => Ok(services),
     }
+}
+
+/// Android [receiver element](https://developer.android.com/guide/topics/manifest/receiver-element).
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct Receiver {
+    #[serde(rename(serialize = "@android:name"))]
+    pub name: String,
+    #[serde(
+        rename(serialize = "@android:exported"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exported: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:enabled"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:permission"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission: Option<String>,
+    #[serde(
+        rename(serialize = "@android:label"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub label: Option<String>,
+    #[serde(
+        rename(serialize = "@android:icon"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub icon: Option<String>,
+    #[serde(
+        rename(serialize = "@android:directBootAware"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub direct_boot_aware: Option<bool>,
+
+    #[serde(rename(serialize = "meta-data"))]
+    #[serde(default)]
+    pub meta_data: Vec<MetaData>,
+    #[serde(rename(serialize = "intent-filter"))]
+    #[serde(default)]
+    pub intent_filter: Vec<IntentFilter>,
+}
+
+fn deserialize_receivers<'de, D>(deserializer: D) -> Result<Vec<Receiver>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        One(T),
+        Many(Vec<T>),
+    }
+
+    match OneOrMany::<Receiver>::deserialize(deserializer)? {
+        OneOrMany::One(receiver) => Ok(vec![receiver]),
+        OneOrMany::Many(receivers) => Ok(receivers),
+    }
+}
+
+/// Android [profileable element](https://developer.android.com/guide/topics/manifest/profileable-element).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Profileable {
+    #[serde(
+        rename(serialize = "@android:shell"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub shell: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:enabled"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
+}
+
+/// Android [uses-native-library element](https://developer.android.com/guide/topics/manifest/uses-native-library-element).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NativeLibrary {
+    #[serde(rename(serialize = "@android:name"))]
+    pub name: String,
+    #[serde(
+        rename(serialize = "@android:required"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required: Option<bool>,
 }
 
 /// Android [intent filter element](https://developer.android.com/guide/topics/manifest/intent-filter-element).

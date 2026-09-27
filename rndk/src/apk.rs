@@ -20,6 +20,23 @@ pub enum BuildFormat {
     Aab,
 }
 
+/// Android's `PER_USER_RANGE`: app ids are offset by this much per user, so
+/// `uid / PER_USER_RANGE` is the user id.
+const PER_USER_RANGE: u32 = 100_000;
+
+/// `fs::copy` also copies permission bits, which makes a rebuild fail when the
+/// source is read-only (a read-only SDK in `/nix/store`, for example).
+fn set_readable(path: &Path) -> Result<(), NdkError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// The options for how to treat debug symbols that are present in any `.so`
 /// files that are added to the APK.
 ///
@@ -218,7 +235,8 @@ impl<'a> UnalignedApk<'a> {
 
         match self.config.strip {
             StripConfig::Default => {
-                std::fs::copy(path, out)?;
+                std::fs::copy(path, &out)?;
+                set_readable(&out)?;
             }
             StripConfig::Strip | StripConfig::Split => {
                 let obj_copy = self.config.ndk.toolchain_bin("objcopy", target)?;
@@ -612,7 +630,11 @@ impl Apk {
     pub fn install(&self, device_serial: Option<&str>) -> Result<(), NdkError> {
         let mut adb = self.ndk.adb(device_serial)?;
 
-        adb.arg("install").arg("-r").arg(&self.path);
+        adb.arg("install")
+            .arg("-r")
+            .arg("--user")
+            .arg(self.current_user(device_serial)?.to_string())
+            .arg(&self.path);
         if !adb.status()?.success() {
             return Err(NdkError::CmdFailed(Box::new(adb)));
         }
@@ -624,6 +646,8 @@ impl Apk {
         adb.arg("shell")
             .arg("am")
             .arg("start")
+            .arg("--user")
+            .arg(self.current_user(device_serial)?.to_string())
             .arg("-a")
             .arg("android.intent.action.MAIN")
             .arg("-c")
@@ -636,6 +660,26 @@ impl Apk {
         }
 
         Ok(())
+    }
+
+    /// The Android user (a multi-user device has one per work profile, among
+    /// others) that the package is installed to and launched in. Keeping this
+    /// consistent across `install`, `start` and `uidof` matters on devices that
+    /// report the package under several users.
+    pub fn current_user(&self, device_serial: Option<&str>) -> Result<u32, NdkError> {
+        let mut adb = self.ndk.adb(device_serial)?;
+        adb.arg("shell").arg("am").arg("get-current-user");
+        let output = adb.output()?;
+
+        if !output.status.success() {
+            return Err(NdkError::CmdFailed(Box::new(adb)));
+        }
+
+        let user = std::str::from_utf8(&output.stdout)
+            .unwrap_or_default()
+            .trim();
+        user.parse()
+            .map_err(|e| NdkError::NotAUserId(e, user.to_owned()))
     }
 
     pub fn uidof(&self, device_serial: Option<&str>) -> Result<u32, NdkError> {
@@ -663,15 +707,28 @@ impl Apk {
                 package: self.package_name.clone(),
                 output: output.to_owned(),
             })?;
-        let uid = uid
+        let uids = uid
             .strip_prefix("uid:")
             .ok_or(NdkError::UidNotInOutput(output.to_owned()))?;
-        let uid = uid
+
+        // A multi-user device reports one uid per user, encoded as
+        // `user_id * PER_USER_RANGE + app_id`; prefer the current user's.
+        let user = self.current_user(device_serial)?;
+        let uids = uids
             .split(',')
-            .find(|part| !part.trim().is_empty())
-            .unwrap_or(uid)
-            .trim();
+            .map(str::trim)
+            .filter(|uid| !uid.is_empty())
+            .collect::<Vec<_>>();
+        let uid = uids
+            .iter()
+            .find(|uid| {
+                uid.parse::<u32>()
+                    .is_ok_and(|uid| uid / PER_USER_RANGE == user)
+            })
+            .or_else(|| uids.first())
+            .ok_or(NdkError::UidNotInOutput(output.to_owned()))?;
+
         uid.parse()
-            .map_err(|e| NdkError::NotAUid(e, uid.to_owned()))
+            .map_err(|e| NdkError::NotAUid(e, (*uid).to_owned()))
     }
 }

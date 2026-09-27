@@ -119,7 +119,8 @@ pub struct Ndk {
     user_home: PathBuf,
     ndk_path: PathBuf,
     build_tools_version: String,
-    build_tag: u32,
+    /// `(major, minor, patch)` of the NDK's `Pkg.Revision`.
+    version: (u32, u32, u32),
     platforms: Vec<u32>,
 }
 
@@ -237,36 +238,29 @@ impl Ndk {
             if build_tools_dir.join(&pinned).is_dir() {
                 pinned
             } else {
-                return Err(NdkError::BuildToolsNotFound);
+                return Err(NdkError::BuildToolsNotFound(build_tools_dir));
             }
         } else {
             read_dir(&build_tools_dir)
-                .or(Err(NdkError::PathNotFound(build_tools_dir)))?
+                .or(Err(NdkError::PathNotFound(build_tools_dir.clone())))?
                 .filter_map(|path| path.ok())
                 .filter(|path| path.path().is_dir())
                 .filter_map(|path| path.file_name().into_string().ok())
                 .filter(|name| name.chars().next().unwrap().is_ascii_digit())
                 .max()
-                .ok_or(NdkError::BuildToolsNotFound)?
+                .ok_or_else(|| NdkError::BuildToolsNotFound(build_tools_dir.clone()))?
         };
 
-        let build_tag = read_to_string(ndk_path.join("source.properties"))
+        let source_properties = read_to_string(ndk_path.join("source.properties"))
             .map_err(|e| NdkError::IoPathError(ndk_path.join("source.properties"), e))?;
 
-        let build_tag = build_tag
+        let (major, minor, patch, _) = source_properties
             .lines()
             .find_map(|line| {
                 let (key, value) = line.split_once('=')?;
-                if key.trim() == "Pkg.Revision" {
-                    let mut parts = value.trim().split('.');
-                    let _major = parts.next()?;
-                    let _minor = parts.next()?;
-                    let patch = parts.next()?;
-                    let patch = patch.split_once('-').map_or(patch, |(patch, _beta)| patch);
-                    patch.parse::<u32>().ok()
-                } else {
-                    None
-                }
+                (key.trim() == "Pkg.Revision")
+                    .then(|| value.trim())
+                    .and_then(parse_pkg_revision)
             })
             .ok_or(NdkError::InvalidSemver)?;
 
@@ -285,39 +279,73 @@ impl Ndk {
             .and_then(|s| s.parse().ok())
             .ok_or(NdkError::InvalidSemver)?;
         let platforms_dir = sdk_path.join("platforms");
-        let platforms: Vec<u32> = read_dir(&platforms_dir)
-            .or(Err(NdkError::PathNotFound(platforms_dir)))?
+        let mut installed: Vec<u32> = read_dir(&platforms_dir)
+            .or(Err(NdkError::PathNotFound(platforms_dir.clone())))?
             .filter_map(|path| path.ok())
             .filter(|path| path.path().is_dir())
             .filter_map(|path| path.file_name().into_string().ok())
+            // Android 16 QPR2 and later ship minor API levels (`android-36.1`).
+            // They are not separately targetable, so only the major level counts.
             .filter_map(|name| {
                 name.strip_prefix("android-")
                     .and_then(|api| api.split('.').next()?.parse::<u32>().ok())
             })
-            .filter(|level| *level >= min_platform_level)
             .collect();
+        installed.sort_unstable();
+        installed.dedup();
 
-        let mut excess: Vec<u32> = platforms
-            .iter()
-            .copied()
-            .filter(|l| *l > max_platform_level)
-            .collect();
-        excess.sort_unstable();
-        excess.dedup();
-        if !excess.is_empty() {
-            eprintln!(
-                "warning: SDK has platforms ({}) newer than NDK max platform level ({})",
-                excess
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                max_platform_level,
-            );
+        if installed.is_empty() {
+            return Err(NdkError::NoPlatformFound(platforms_dir));
         }
 
+        let warn_unusable = |label: &str, levels: Vec<u32>| {
+            if levels.is_empty() {
+                return;
+            }
+            let levels = levels
+                .into_iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "warning: SDK has platforms ({levels}) {label} than the NDK supports \
+                 ({min_platform_level} to {max_platform_level})"
+            );
+        };
+        warn_unusable(
+            "older",
+            installed
+                .iter()
+                .copied()
+                .filter(|l| *l < min_platform_level)
+                .collect(),
+        );
+        warn_unusable(
+            "newer",
+            installed
+                .iter()
+                .copied()
+                .filter(|l| *l > max_platform_level)
+                .collect(),
+        );
+
+        let platforms: Vec<u32> = installed
+            .iter()
+            .copied()
+            .filter(|level| (min_platform_level..=max_platform_level).contains(level))
+            .collect();
+
         if platforms.is_empty() {
-            return Err(NdkError::NoPlatformFound);
+            return Err(NdkError::NoPlatformInRange(
+                platforms_dir,
+                installed
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                min_platform_level,
+                max_platform_level,
+            ));
         }
 
         Ok(Self {
@@ -325,7 +353,7 @@ impl Ndk {
             user_home,
             ndk_path,
             build_tools_version,
-            build_tag,
+            version: (major, minor, patch),
             platforms,
         })
     }
@@ -347,8 +375,20 @@ impl Ndk {
             .is_some_and(|(ma, mi, pa, _)| (ma, mi, pa) >= min)
     }
 
+    /// `Pkg.Revision` of the detected NDK as `(major, minor, patch)`.
+    pub fn version(&self) -> (u32, u32, u32) {
+        self.version
+    }
+
+    /// Whether the detected NDK is at least `(major, minor)`.
+    pub fn version_at_least(&self, min: (u32, u32)) -> bool {
+        (self.version.0, self.version.1) >= min
+    }
+
+    /// The `Pkg.Revision` patch component, historically used to feature-detect
+    /// whether the NDK still ships `libgcc`.
     pub fn build_tag(&self) -> u32 {
-        self.build_tag
+        self.version.2
     }
 
     pub fn platforms(&self) -> &[u32] {
@@ -408,15 +448,37 @@ impl Ndk {
     }
 
     pub fn platform_dir(&self, platform: u32) -> Result<PathBuf, NdkError> {
+        let platforms_dir = self.sdk_path.join("platforms");
         for suffix in [
             format!("android-{platform}"),
             format!("android-{platform}.0"),
         ] {
-            let dir = self.sdk_path.join("platforms").join(&suffix);
+            let dir = platforms_dir.join(&suffix);
             if dir.exists() {
                 return Ok(dir);
             }
         }
+
+        // Only a minor API level may be installed for a given major level
+        // (e.g. `android-36.1`); that platform is the one to build against.
+        let prefix = format!("android-{platform}.");
+        for entry in read_dir(&platforms_dir)
+            .map_err(|e| NdkError::IoPathError(platforms_dir.clone(), e))?
+            .flatten()
+        {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return Ok(entry.path());
+            }
+        }
+
         Err(NdkError::PlatformNotFound(platform))
     }
 

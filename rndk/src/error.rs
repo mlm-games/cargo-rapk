@@ -31,10 +31,20 @@ pub enum NdkError {
     PathNotFound(PathBuf),
     #[error("Command `{0}` not found.")]
     CmdNotFound(String),
-    #[error("Android SDK has no build tools.")]
-    BuildToolsNotFound,
-    #[error("Android SDK has no platforms installed.")]
-    NoPlatformFound,
+    #[error(
+        "Android SDK has no build tools in `{0:?}`; install one with `sdkmanager \"build-tools;NN.0.0\"`."
+    )]
+    BuildToolsNotFound(PathBuf),
+    #[error(
+        "No Android SDK platform found in `{0:?}`; install one with `sdkmanager \"platforms;android-NN\"`."
+    )]
+    NoPlatformFound(PathBuf),
+    #[error(
+        "None of the Android SDK platforms installed in `{0:?}` ({1}) are supported by this NDK, \
+        which supports platforms {2} to {3}. Install a supported platform with \
+        `sdkmanager \"platforms;android-{2}\"`."
+    )]
+    NoPlatformInRange(PathBuf, String, u32, u32),
     #[error("Platform `{0}` is not installed.")]
     PlatformNotFound(u32),
     #[error("Target is not supported.")]
@@ -65,6 +75,8 @@ pub enum NdkError {
     Serialize(#[from] SeError),
     #[error("String `{1}` is not a UID")]
     NotAUid(#[source] ParseIntError, String),
+    #[error("String `{1}` is not an Android user id")]
+    NotAUserId(#[source] ParseIntError, String),
     #[error("Could not find `package:{package}` in output `{output}`")]
     PackageNotInOutput { package: String, output: String },
     #[error("Could not find `uid:` in output `{0}`")]

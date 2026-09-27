@@ -26,5 +26,6 @@ pub mod kotlin;
 pub mod manifest;
 pub mod ndk;
 pub mod readelf;
+pub mod rustflags;
 pub mod target;
 pub mod zipnorm;

@@ -18,6 +18,7 @@ quick-xml = { version = "0.40", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["formatting"] }
+toml = "1.1.6"
 which = "8"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 log = "0.4.32"

@@ -59,6 +59,26 @@ Invoke `cargo rapk help` for a more detailed overview of all available commands 
 
 Like `cargo`, the above subcommands from `cargo rapk` support selecting the target to build and/or run using `--package`/`-p` (which picks the library target inside the crate) or `--example`, as long as the Cargo Target is a `cdylib` as described above.
 
+### Page sizes
+
+Android 15 devices may run with 16KiB pages. Libraries are linked with
+`-Wl,-z,max-page-size=16384` for NDK versions older than r28 (which align by
+default) and `zipalign`ed to a 16KiB page boundary, so the APK can be `mmap`ed
+straight out of the archive. Older `build-tools` releases lack the `zipalign -P`
+flag needed for this; on those, the `CARGO_RAPK_PAGE_SIZE_KB` environment
+variable can set the page size explicitly (`4`, `16` or `64`).
+
+### Rustflags
+
+`cargo rapk` has to export `CARGO_ENCODED_RUSTFLAGS` so that its linker
+arguments reach transitive `cdylib` builds, and Cargo gives that environment
+variable precedence over its configuration files. To keep configuration from
+being silently dropped, `build.rustflags` and `target.<triple>.rustflags` are
+resolved from the Cargo configuration hierarchy and merged in, following the
+same precedence Cargo applies. `target.<cfg>.rustflags` entries cannot be
+evaluated without the target's full `rustc --print cfg` set and are reported
+rather than applied; set `RUSTFLAGS` to use those.
+
 ## Manifest
 
 `cargo rapk` reads additional configuration from Cargo's `[package.metadata]` table. The following configuration options are supported by `cargo rapk` under `[package.metadata.android]`:
@@ -242,6 +262,31 @@ extract_native_libs = true
 # See https://developer.android.com/guide/topics/manifest/application-element#usesCleartextTraffic
 uses_cleartext_traffic = true
 
+# See https://developer.android.com/guide/topics/manifest/application-element#requestLegacyExternalStorage
+request_legacy_external_storage = true
+
+# See https://developer.android.com/guide/topics/manifest/application-element#allowNativeHeapPointerTagging
+allow_native_heap_pointer_tagging = true
+
+# See https://developer.android.com/guide/topics/manifest/application-element#installLocation
+#
+# One of "auto", "internalOnly" or "preferExternal". Required by Meta Quest AppLab.
+install_location = "auto"
+
+# See https://developer.android.com/guide/topics/manifest/profileable-element
+[package.metadata.android.application.profileable]
+shell = true
+
+# See https://developer.android.com/guide/topics/manifest/uses-native-library-element
+#
+# Vendor-provided shared libraries that the app must be linked against; they
+# are not accessible by default when targeting Android 12 (API 31) or higher.
+#
+# Note: there can be multiple .uses_native_library entries.
+[[package.metadata.android.application.uses_native_library]]
+name = "libopenxr.google.so"
+required = false
+
 # See https://developer.android.com/guide/topics/manifest/meta-data-element
 #
 # Note: there can be several .meta_data entries.
@@ -249,6 +294,18 @@ uses_cleartext_traffic = true
 [[package.metadata.android.application.meta_data]]
 name = "com.samsung.android.vr.application.mode"
 value = "vr_only"
+
+# See https://developer.android.com/guide/topics/manifest/receiver-element
+#
+# `cargo rapk` accepts both a single `[...receiver]` table and repeated
+# `[[...receiver]]` tables.
+[[package.metadata.android.application.receiver]]
+name = "com.example.BootReceiver"
+exported = true
+
+# See https://developer.android.com/guide/topics/manifest/intent-filter-element
+[[package.metadata.android.application.receiver.intent_filter]]
+actions = ["android.intent.action.BOOT_COMPLETED"]
 
 # See https://developer.android.com/guide/topics/manifest/activity-element
 #

@@ -45,7 +45,9 @@ impl Manifest {
             .android
             .unwrap_or_default();
         Ok(Self {
-            version: package.version,
+            version: package
+                .version
+                .unwrap_or(Inheritable::Value("0.0.0".to_owned())),
             apk_name: metadata.apk_name,
             android_manifest: metadata.android_manifest,
             build_targets: metadata.build_targets,
@@ -76,7 +78,8 @@ impl Root {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Package {
-    pub(crate) version: Inheritable<String>,
+    /// Optional since Cargo 1.75, defaulting to `0.0.0` like Cargo does.
+    pub(crate) version: Option<Inheritable<String>>,
     pub(crate) metadata: Option<PackageMetadata>,
 }
 

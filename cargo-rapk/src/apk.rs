@@ -339,6 +339,11 @@ impl<'a> ApkBuilder<'a> {
             .apk_name
             .clone()
             .unwrap_or_else(|| artifact.name.to_string());
+        // Uncompressed libraries are `mmap`ed straight out of the APK, which
+        // requires `extractNativeLibs="false"`; a release build that claims
+        // otherwise is invalid.
+        let disable_aapt_compression =
+            is_debug_profile || manifest.application.extract_native_libs == Some(false);
 
         let config = ApkConfig {
             ndk: self.ndk.clone(),
@@ -347,7 +352,7 @@ impl<'a> ApkBuilder<'a> {
             assets,
             resources,
             manifest,
-            disable_aapt_compression: is_debug_profile,
+            disable_aapt_compression,
             strip: self.manifest.strip,
             reverse_port_forward: self.manifest.reverse_port_forward.clone(),
             format: self.format,

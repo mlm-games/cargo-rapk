@@ -1,4 +1,12 @@
-# Unreleased
+# 0.24.0 (2026-09-27)
+
+- Link libraries with 16KiB alignment for NDK versions older than r28, so that APKs remain loadable on Android 15+ devices that run with 16KiB pages. ([#76](https://github.com/rust-mobile/cargo-apk/pull/76))
+- Resolve `build.rustflags` and `target.<triple>.rustflags` from the Cargo configuration hierarchy and merge them into the exported `CARGO_ENCODED_RUSTFLAGS`, which otherwise shadows them. Builds that configured `build.rustflags` but relied on `cargo rapk` dropping them now receive those flags, as plain `cargo build` does; set `RUSTFLAGS` to keep overriding the configuration. ([#22](https://github.com/rust-mobile/cargo-apk/issues/22))
+- Fall back to an installed minor API level (such as `android-36.1`) when no exact `platforms/android-NN` directory exists. ([#75](https://github.com/rust-mobile/cargo-apk/pull/75))
+- Distinguish "no SDK platforms installed" from "no installed platform is supported by this NDK", and name the platforms found and supported in the error. ([#79](https://github.com/rust-mobile/cargo-apk/pull/79))
+- Add `uses-native-library` and `profileable` elements, a `receiver` element, and the `android:installLocation`, `android:requestLegacyExternalStorage` and `android:allowNativeHeapPointerTagging` attributes on `Application`. ([#87](https://github.com/rust-mobile/cargo-apk/pull/87), [#85](https://github.com/rust-mobile/cargo-apk/pull/85), [#58](https://github.com/rust-mobile/cargo-apk/pull/58), [#81](https://github.com/rust-mobile/cargo-apk/issues/81))
+- Install, launch and look up the uid under the device's current user, so that multi-user devices with a work profile no longer report another user's uid. ([#57](https://github.com/rust-mobile/cargo-apk/pull/57))
+- Do not copy permission bits when adding a library to the APK, so that a rebuild does not fail against a read-only source such as a Nix store SDK. ([#21](https://github.com/rust-mobile/cargo-apk/pull/21))
 
 # 0.10.0 (2023-11-30)
 

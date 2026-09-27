@@ -1,6 +1,12 @@
-# Unreleased
+# 0.24.0 (2026-09-27)
 
 - **Breaking:** Default `target_sdk_version` to `35` (if installed), matching Google Play requirements starting August 31 2025.
+- Accept a `Cargo.toml` without a `package.version` field, which Cargo has made optional since 1.75, defaulting it to `0.0.0` as Cargo does. ([#56](https://github.com/rust-mobile/cargo-apk/pull/56))
+- Store libraries uncompressed when `application.extract_native_libs` is `false`, since the installer only `mmap`s uncompressed libraries out of the APK; a release build that claimed otherwise produced an invalid APK. ([#32](https://github.com/rust-mobile/cargo-apk/issues/32))
+- Support the `receiver` element and the `uses-native-library`, `profileable` and `install_location` manifest options. ([#85](https://github.com/rust-mobile/cargo-apk/pull/85), [#87](https://github.com/rust-mobile/cargo-apk/pull/87), [#58](https://github.com/rust-mobile/cargo-apk/pull/58))
+- Support the `request_legacy_external_storage` and `allow_native_heap_pointer_tagging` manifest options. ([#82](https://github.com/rust-mobile/cargo-apk/pull/82))
+- Bump `rndk` with 16KiB page alignment, Cargo configuration `rustflags` support, current-user `adb` operations and minor API level platform detection.
+- **Breaking:** `build.rustflags` and `target.<triple>.rustflags` from the Cargo configuration are now applied to Android builds, as they already were for host builds; set `RUSTFLAGS` to keep overriding the configuration.
 
 # 0.10.0 (2023-11-30)
 

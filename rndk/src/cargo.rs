@@ -19,21 +19,24 @@ pub fn cargo_ndk(
     const SEP: &str = "\x1f";
 
     // Read initial CARGO_ENCODED_/RUSTFLAGS into a String
-    let mut rustflags = match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
-        Ok(val) => val,
+    let (mut rustflags, from_env) = match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+        Ok(val) => (val, true),
         Err(std::env::VarError::NotPresent) => match std::env::var("RUSTFLAGS") {
             Ok(val) => {
                 cargo.env_remove("RUSTFLAGS");
 
                 // Same as cargo
                 // https://github.com/rust-lang/cargo/blob/f6de921a5d807746e972d9d10a4d8e1ca21e1b1f/src/cargo/core/compiler/build_context/target_info.rs#L682-L690
-                val.split(' ')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(SEP)
+                (
+                    val.split(' ')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(SEP),
+                    true,
+                )
             }
-            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(std::env::VarError::NotPresent) => (String::new(), false),
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(NdkError::NonUnicodeEnvVar("RUSTFLAGS"));
             }
@@ -42,6 +45,17 @@ pub fn cargo_ndk(
             return Err(NdkError::NonUnicodeEnvVar("CARGO_ENCODED_RUSTFLAGS"));
         }
     };
+
+    // The env var we export below outranks every Cargo configuration file, so
+    // flags configured there have to be merged in by hand.
+    if !from_env {
+        for flag in crate::rustflags::config_rustflags(triple) {
+            if !rustflags.is_empty() {
+                rustflags.push_str(SEP);
+            }
+            rustflags.push_str(&flag);
+        }
+    }
 
     let (clang, clang_pp) = ndk.clang()?;
 
@@ -60,6 +74,14 @@ pub fn cargo_ndk(
     }
     rustflags.push_str("-Clink-arg=");
     rustflags.push_str(&clang_target);
+
+    // Android 15 devices may run with 16KiB pages, which requires every ELF
+    // section to be 16KiB aligned. NDK r28 aligns them by default.
+    // https://developer.android.com/guide/practices/page-sizes#compile-r28
+    if !ndk.version_at_least((28, 0)) {
+        rustflags.push_str(SEP);
+        rustflags.push_str("-Clink-arg=-Wl,-z,max-page-size=16384");
+    }
 
     let ar = ndk.toolchain_bin("ar", target)?;
     cargo.env(format!("AR_{triple}"), &ar);
