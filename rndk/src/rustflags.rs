@@ -28,11 +28,16 @@ pub fn config_rustflags(triple: &str) -> Vec<String> {
     }
 
     if !cfgs.is_empty() {
-        eprintln!(
-            "warning: ignoring `target.<cfg>.rustflags` in the Cargo configuration ({}); \
-             `cfg()` matching is not evaluated, set `RUSTFLAGS` instead",
-            cfgs.join(", ")
-        );
+        // Reported once per process: a multi-target build resolves each target
+        // separately, and the configuration does not change between them.
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            eprintln!(
+                "warning: ignoring `target.<cfg>.rustflags` in the Cargo configuration ({}); \
+                 `cfg()` matching is not evaluated, set `RUSTFLAGS` instead",
+                cfgs.join(", ")
+            );
+        });
     }
 
     if target.is_empty() { build } else { target }

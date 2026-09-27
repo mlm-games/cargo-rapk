@@ -628,11 +628,9 @@ impl Apk {
     pub fn install(&self, device_serial: Option<&str>) -> Result<(), NdkError> {
         let mut adb = self.ndk.adb(device_serial)?;
 
-        adb.arg("install")
-            .arg("-r")
-            .arg("--user")
-            .arg(self.current_user(device_serial)?.to_string())
-            .arg(&self.path);
+        // `adb install` has no `--user`; scoping the install would mean pushing
+        // the APK and handing it to `pm install`, losing incremental install.
+        adb.arg("install").arg("-r").arg(&self.path);
         if !adb.status()?.success() {
             return Err(NdkError::CmdFailed(Box::new(adb)));
         }
@@ -644,8 +642,10 @@ impl Apk {
         adb.arg("shell")
             .arg("am")
             .arg("start")
+            // `current` is the documented spelling for the foreground user, which
+            // is the one `cargo rapk` launched into and filters `logcat` by.
             .arg("--user")
-            .arg(self.current_user(device_serial)?.to_string())
+            .arg("current")
             .arg("-a")
             .arg("android.intent.action.MAIN")
             .arg("-c")
@@ -660,10 +660,10 @@ impl Apk {
         Ok(())
     }
 
-    /// The Android user (a multi-user device has one per work profile, among
-    /// others) that the package is installed to and launched in. Keeping this
-    /// consistent across `install`, `start` and `uidof` matters on devices that
-    /// report the package under several users.
+    /// The foreground Android user, which on a multi-user device (one with a
+    /// work profile, for instance) is not necessarily the only one the package
+    /// is installed for. `pm list package -U` reports a uid per user, so this
+    /// is what picks the one to filter `logcat` by.
     pub fn current_user(&self, device_serial: Option<&str>) -> Result<u32, NdkError> {
         let mut adb = self.ndk.adb(device_serial)?;
         adb.arg("shell").arg("am").arg("get-current-user");

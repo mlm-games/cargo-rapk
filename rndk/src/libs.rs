@@ -189,17 +189,17 @@ impl LibResolver {
         Ok(())
     }
 
-    /// The single file to package for each library name that is not on the
-    /// device, keyed by the name it takes inside the APK.
+    /// The single file to package for each library name, keyed by the name it
+    /// takes inside the APK.
+    ///
+    /// Libraries the platform provides only reach this table when the caller
+    /// registered one explicitly, which is taken as intent to package it.
     pub fn resolve(&mut self) -> Result<BTreeMap<String, PathBuf>, NdkError> {
         let mut resolved: BTreeMap<String, PathBuf> = BTreeMap::new();
 
         loop {
             let mut changed = false;
             for name in self.candidates.names().cloned().collect::<Vec<_>>() {
-                if self.on_device.contains(&name) {
-                    continue;
-                }
                 let Some(path) = self.candidates.pick(&name)? else {
                     continue;
                 };
@@ -223,6 +223,10 @@ impl LibResolver {
     }
 
     /// Offers a candidate for every `DT_NEEDED` entry of a packaged library.
+    ///
+    /// This is the only place the platform's own libraries are filtered out, so
+    /// a library the caller registered explicitly is still packaged even when
+    /// the device also provides it.
     fn discover(&mut self, path: &Path) -> Result<(), NdkError> {
         for need in self.needed(path)? {
             if self.on_device.contains(&need) || self.candidates.contains(&need) {
