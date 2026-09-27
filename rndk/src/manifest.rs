@@ -38,6 +38,14 @@ pub struct AndroidManifest {
     #[serde(default)]
     pub uses_permission: Vec<Permission>,
 
+    /// Permissions this manifest *defines*, as opposed to `uses_permission`
+    /// which requests one. A library that defines a custom permission (to make
+    /// its own non-exported components enforceable) needs the definition merged
+    /// too, or the app requests a permission nothing declares.
+    #[serde(rename(serialize = "permission"))]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission: Vec<Permission>,
+
     #[serde(default)]
     pub queries: Option<Queries>,
 
@@ -56,6 +64,7 @@ impl Default for AndroidManifest {
             sdk: Default::default(),
             uses_feature: Default::default(),
             uses_permission: Default::default(),
+            permission: Default::default(),
             queries: Default::default(),
             application: Default::default(),
         }
@@ -78,24 +87,44 @@ impl AndroidManifest {
     /// them means it was not built for independent merging.
     pub fn merge_library(&mut self, library: &AndroidManifest, application_id: &str) {
         for permission in &library.uses_permission {
+            let permission = Permission {
+                name: substitute_application_id(&permission.name, application_id),
+                max_sdk_version: permission.max_sdk_version,
+            };
             if !self
                 .uses_permission
                 .iter()
                 .any(|p| p.name == permission.name)
             {
-                self.uses_permission.push(permission.clone());
+                self.uses_permission.push(permission);
+            }
+        }
+
+        for permission in &library.permission {
+            let permission = Permission {
+                name: substitute_application_id(&permission.name, application_id),
+                max_sdk_version: permission.max_sdk_version,
+            };
+            if !self.permission.iter().any(|p| p.name == permission.name) {
+                self.permission.push(permission);
             }
         }
 
         for meta_data in &library.application.meta_data {
-            if !self
+            if self
                 .application
                 .meta_data
                 .iter()
                 .any(|m| m.name == meta_data.name)
             {
-                self.application.meta_data.push(meta_data.clone());
+                continue;
             }
+            let mut meta_data = meta_data.clone();
+            meta_data.name = substitute_application_id(&meta_data.name, application_id);
+            if let Some(value) = &meta_data.value {
+                meta_data.value = Some(substitute_application_id(value, application_id));
+            }
+            self.application.meta_data.push(meta_data);
         }
 
         for provider in &library.application.provider {
@@ -111,15 +140,286 @@ impl AndroidManifest {
             // A provider declared with `${applicationId}` in its authorities
             // only resolves once the app id is known.
             if let Some(authorities) = &provider.authorities {
-                provider.authorities = Some(
-                    authorities
-                        .replace("${applicationId}", application_id)
-                        .replace("${applicationIdSuffix}", ""),
-                );
+                provider.authorities = Some(substitute_application_id(authorities, application_id));
+            }
+            for meta_data in &mut provider.meta_data {
+                meta_data.name = substitute_application_id(&meta_data.name, application_id);
+                if let Some(value) = &meta_data.value {
+                    meta_data.value = Some(substitute_application_id(value, application_id));
+                }
             }
             self.application.provider.push(provider);
         }
+
+        for receiver in &library.application.receiver {
+            if self
+                .application
+                .receiver
+                .iter()
+                .any(|r| r.name == receiver.name)
+            {
+                continue;
+            }
+            let mut receiver = receiver.clone();
+            receiver.name = substitute_application_id(&receiver.name, application_id);
+            if let Some(permission) = &receiver.permission {
+                receiver.permission = Some(substitute_application_id(permission, application_id));
+            }
+            for meta_data in &mut receiver.meta_data {
+                meta_data.name = substitute_application_id(&meta_data.name, application_id);
+            }
+            self.application.receiver.push(receiver);
+        }
+
+        if let Some(queries) = &library.queries {
+            let target = self.queries.get_or_insert_with(Queries::default);
+            for package in &queries.package {
+                if !target.package.iter().any(|p| p.name == package.name) {
+                    target.package.push(package.clone());
+                }
+            }
+            for provider in &queries.provider {
+                if !target
+                    .provider
+                    .iter()
+                    .any(|p| p.authorities == provider.authorities && p.name == provider.name)
+                {
+                    target.provider.push(provider.clone());
+                }
+            }
+            for intent in &queries.intent {
+                target.intent.push(intent.clone());
+            }
+        }
     }
+}
+
+/// Resolves the placeholders a library manifest may use for the app's own id.
+/// `applicationIdSuffix` is dropped rather than substituted, since cargo-rapk
+/// does not append a suffix to the package name.
+fn substitute_application_id(value: &str, application_id: &str) -> String {
+    value
+        .replace("${applicationId}", application_id)
+        .replace("${applicationIdSuffix}", "")
+}
+
+/// Reads a library manifest into the subset that [`AndroidManifest::merge_library`]
+/// folds into the app's.
+///
+/// This cannot use the serde deserializer. Attribute renames in this module are
+/// declared with `rename(serialize = ...)`, which affects only output, and the
+/// deserializer matches attributes by their exact name, so a field renamed
+/// `@android:name` never sees the `android:name` in the document — it silently
+/// reads as absent. The event reader's `local_name()` does drop the prefix, so
+/// attributes are read here by hand. Serde still does all the writing.
+pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
+    use quick_xml::events::Event;
+
+    fn attributes(start: &quick_xml::events::BytesStart) -> Result<Vec<(String, String)>, String> {
+        let mut out = Vec::new();
+        for attr in start.attributes().with_checks(false) {
+            let attr = attr.map_err(|e| e.to_string())?;
+            let key = String::from_utf8_lossy(attr.key.local_name().as_ref()).into_owned();
+            out.push((
+                key,
+                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|e| e.to_string())?
+                    .into_owned(),
+            ));
+        }
+        Ok(out)
+    }
+
+    fn get<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn flag(attrs: &[(String, String)], name: &str) -> Option<bool> {
+        get(attrs, name).and_then(|v| v.parse().ok())
+    }
+
+    fn number(attrs: &[(String, String)], name: &str) -> Option<u32> {
+        get(attrs, name).and_then(|v| v.parse().ok())
+    }
+
+    fn named(attrs: &[(String, String)]) -> String {
+        get(attrs, "name").unwrap_or_default().to_owned()
+    }
+
+    fn meta_data(attrs: &[(String, String)]) -> MetaData {
+        MetaData {
+            name: named(attrs),
+            value: get(attrs, "value").map(str::to_owned),
+            resource: get(attrs, "resource").map(str::to_owned),
+        }
+    }
+
+    fn intent_filter_attrs(attrs: &[(String, String)]) -> Vec<String> {
+        get(attrs, "name")
+            .map(|n| vec![n.to_owned()])
+            .unwrap_or_default()
+    }
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut manifest = AndroidManifest::default();
+    let mut path: Vec<String> = Vec::new();
+    let mut provider: Option<Provider> = None;
+    let mut receiver: Option<Receiver> = None;
+    let mut filter: Option<IntentFilter> = None;
+    let mut queries: Option<Queries> = None;
+
+    loop {
+        let (name, attrs, is_start) = match reader.read_event() {
+            Ok(Event::Start(e)) => (
+                String::from_utf8_lossy(e.local_name().as_ref()).into_owned(),
+                attributes(&e)?,
+                true,
+            ),
+            Ok(Event::Empty(e)) => (
+                String::from_utf8_lossy(e.local_name().as_ref()).into_owned(),
+                attributes(&e)?,
+                false,
+            ),
+            Ok(Event::End(_)) => {
+                let closed = path.pop();
+                let owner = path.last().map(String::as_str).unwrap_or_default();
+                match closed.as_deref() {
+                    Some("provider") => {
+                        if let Some(done) = provider.take() {
+                            manifest.application.provider.push(done);
+                        }
+                    }
+                    Some("receiver") => {
+                        if let Some(done) = receiver.take() {
+                            manifest.application.receiver.push(done);
+                        }
+                    }
+                    Some("intent-filter") | Some("intent") => {
+                        if let Some(done) = filter.take() {
+                            if owner == "queries"
+                                && let Some(queries) = queries.as_mut()
+                            {
+                                queries.intent.push(done);
+                            } else if let Some(receiver) = receiver.as_mut() {
+                                receiver.intent_filter.push(done);
+                            }
+                        }
+                    }
+                    Some("queries") => {
+                        if let Some(done) = queries.take() {
+                            manifest.queries = Some(done);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let parent = path.last().map(String::as_str).unwrap_or_default();
+
+        match (parent, name.as_str()) {
+            ("", "manifest") => manifest.package = named(&attrs),
+            ("manifest", "uses-permission") => manifest.uses_permission.push(Permission {
+                name: named(&attrs),
+                max_sdk_version: number(&attrs, "maxSdkVersion"),
+            }),
+            ("manifest", "permission") => manifest.permission.push(Permission {
+                name: named(&attrs),
+                max_sdk_version: number(&attrs, "maxSdkVersion"),
+            }),
+            ("manifest", "queries") if is_start => queries = Some(Queries::default()),
+            ("queries", "package") => {
+                if let Some(q) = queries.as_mut() {
+                    q.package.push(Package {
+                        name: named(&attrs),
+                    });
+                }
+            }
+            ("queries", "provider") => {
+                if let Some(q) = queries.as_mut() {
+                    q.provider.push(QueryProvider {
+                        authorities: get(&attrs, "authorities").unwrap_or_default().to_owned(),
+                        name: get(&attrs, "name").map(str::to_owned),
+                    });
+                }
+            }
+            ("queries", "intent") if is_start => filter = Some(IntentFilter::default()),
+            ("application", "meta-data") => manifest.application.meta_data.push(meta_data(&attrs)),
+            ("application", "provider") if is_start => {
+                provider = Some(Provider {
+                    name: named(&attrs),
+                    authorities: get(&attrs, "authorities").map(str::to_owned),
+                    exported: flag(&attrs, "exported"),
+                    enabled: flag(&attrs, "enabled"),
+                    init_order: get(&attrs, "initOrder").and_then(|v| v.parse().ok()),
+                    multiprocess: flag(&attrs, "multiprocess"),
+                    process: get(&attrs, "process").map(str::to_owned),
+                    grant_uri_permissions: flag(&attrs, "grantUriPermissions"),
+                    meta_data: Vec::new(),
+                });
+            }
+            ("provider", "meta-data") => {
+                if let Some(p) = provider.as_mut() {
+                    p.meta_data.push(meta_data(&attrs));
+                }
+            }
+            ("application", "receiver") if is_start => {
+                receiver = Some(Receiver {
+                    name: named(&attrs),
+                    exported: flag(&attrs, "exported"),
+                    enabled: flag(&attrs, "enabled"),
+                    permission: get(&attrs, "permission").map(str::to_owned),
+                    label: get(&attrs, "label").map(str::to_owned),
+                    icon: get(&attrs, "icon").map(str::to_owned),
+                    direct_boot_aware: flag(&attrs, "directBootAware"),
+                    meta_data: Vec::new(),
+                    intent_filter: Vec::new(),
+                });
+            }
+            ("receiver", "meta-data") => {
+                if let Some(r) = receiver.as_mut() {
+                    r.meta_data.push(meta_data(&attrs));
+                }
+            }
+            ("receiver", "intent-filter") | ("queries", "intent") if is_start => {
+                filter = Some(IntentFilter::default())
+            }
+            ("intent-filter", "action") => {
+                if let Some(f) = filter.as_mut() {
+                    f.actions.extend(intent_filter_attrs(&attrs));
+                }
+            }
+            ("intent-filter", "category") => {
+                if let Some(f) = filter.as_mut() {
+                    f.categories.extend(intent_filter_attrs(&attrs));
+                }
+            }
+            _ => {}
+        }
+
+        if is_start {
+            path.push(name);
+        }
+    }
+
+    if let Some(p) = provider.take() {
+        manifest.application.provider.push(p);
+    }
+    if let Some(r) = receiver.take() {
+        manifest.application.receiver.push(r);
+    }
+    if let Some(q) = queries.take() {
+        manifest.queries = Some(q);
+    }
+    Ok(manifest)
 }
 
 /// Android [application element](https://developer.android.com/guide/topics/manifest/application-element), containing one or more [`Activity`] and [`Service`] elements.

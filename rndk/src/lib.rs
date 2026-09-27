@@ -29,4 +29,5 @@ pub mod maven;
 pub mod ndk;
 pub mod rustflags;
 pub mod target;
+pub mod version;
 pub mod zipnorm;

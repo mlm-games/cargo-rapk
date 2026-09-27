@@ -526,18 +526,18 @@ impl<'a> ApkBuilder<'a> {
             if let Some(res) = &resolved.resources {
                 library_resources.push(res.clone());
             }
-            // `R` generation needs a package, so a library that ships
-            // resources always takes this path; a library that only declares
-            // components is merged into the manifest directly.
-            match (resolved.resources.is_some(), resolved.package) {
-                (true, Some(package)) => {
-                    r_libraries.push((package, resolved.manifest.unwrap_or_default()))
-                }
-                // A jar with no AAR manifest has nothing to merge, and an AAR
-                // without a `package` cannot be given an `R` class.
-                (false, _) => library_manifests.extend(resolved.manifest),
-                (true, None) => {}
+            // `R` generation needs the library's own `package` and its
+            // resources, and nothing else — a library whose manifest declares
+            // no components still ships resources, and `appcompat` is the
+            // common case: an empty manifest and 410 resource files.
+            if resolved.resources.is_some()
+                && let Some(package) = resolved.package.clone()
+            {
+                r_libraries.push((package, String::new()));
             }
+            // Manifest merging is independent of the above, so it cannot be
+            // gated on the manifest having survived the contributions filter.
+            library_manifests.extend(resolved.manifest);
         }
         lib_jars.sort();
         lib_jars.dedup();

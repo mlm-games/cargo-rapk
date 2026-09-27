@@ -309,9 +309,17 @@ fn extract_res(archive_path: &Path, dest: &Path) -> Result<(), String> {
         let Some(relative) = name.strip_prefix("res/") else {
             continue;
         };
-        let Some(out_path) = entry.enclosed_name().map(|p| dest.join(p)) else {
+        if relative.is_empty() {
             continue;
-        };
+        }
+        // `relative` is the path *under* `res/`; joining the archive's own
+        // `res/...` path onto `dest` would nest a second `res` and leave the
+        // tree aapt2 compiles empty. `enclosed_name` is still consulted first,
+        // since it is what rejects a `../` entry escaping `dest`.
+        if entry.enclosed_name().is_none() {
+            continue;
+        }
+        let out_path = dest.join(relative);
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
             continue;
@@ -321,7 +329,6 @@ fn extract_res(archive_path: &Path, dest: &Path) -> Result<(), String> {
         }
         let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
         std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-        let _ = relative;
     }
     Ok(())
 }
@@ -449,6 +456,32 @@ fn extract_lib(archive_path: &Path, dest: &Path, is_aar: bool) -> Result<Vec<Pat
     Ok(jars)
 }
 
+/// Reads `AndroidManifest.xml` out of an already-downloaded archive.
+fn read_archive_manifest(archive: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(archive).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    (0..zip.len()).find_map(|i| {
+        let mut entry = zip.by_index(i).ok()?;
+        if entry.name() != "AndroidManifest.xml" {
+            return None;
+        }
+        let mut xml = String::new();
+        entry.read_to_string(&mut xml).ok()?;
+        Some(xml)
+    })
+}
+
+/// The archive `ensure_lib` downloaded, preferring the AAR since a jar of the
+/// same name may sit beside it.
+fn cached_archive(dir: &Path, coordinates: &Coordinates) -> Option<PathBuf> {
+    let stem = format!("{}-{}", coordinates.artifact, coordinates.version);
+    [".aar", ".jar"]
+        .into_iter()
+        .map(|ext| dir.join(format!("{stem}{ext}")))
+        .find(|p| p.is_file())
+}
+
 /// Re-reads an already-extracted library from the cache, so a cached artifact
 /// costs no network access and no re-extraction.
 fn read_resolved(dir: &Path, coordinates: Coordinates) -> Option<ResolvedLib> {
@@ -462,15 +495,21 @@ fn read_resolved(dir: &Path, coordinates: Coordinates) -> Option<ResolvedLib> {
     if jars.is_empty() {
         return None;
     }
-    let meta = std::fs::read_to_string(dir.join(".cargo-rapk-lib-meta")).ok()?;
-    let package = meta
-        .lines()
-        .find_map(|l| l.strip_prefix("package=").map(str::to_string))
+    // The manifest is re-read from the archive rather than kept in a sidecar
+    // file: an XML document spans many lines, so a `key=value` encoding of it
+    // truncates at the first newline and silently yields a manifest with no
+    // contributions in it.
+    let library_manifest =
+        cached_archive(dir, &coordinates).and_then(|a| read_archive_manifest(&a));
+    let package = library_manifest
+        .as_deref()
+        .and_then(manifest_package)
         .filter(|p| !p.is_empty());
-    let manifest = meta
-        .lines()
-        .find_map(|l| l.strip_prefix("manifest=").map(str::to_string))
-        .filter(|m| !m.is_empty());
+    let manifest = library_manifest.filter(|xml| {
+        manifest_contributions(xml)
+            .map(|c| !c.is_empty())
+            .unwrap_or(true)
+    });
     let resources = {
         let res = dir.join("res");
         res.is_dir().then_some(res)
@@ -545,28 +584,11 @@ pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
         ))
     })?;
 
-    let file = std::fs::File::open(&archive).map_err(|e| fail(e.to_string()))?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| fail(e.to_string()))?;
-
-    let mut library_manifest = None;
-    for i in 0..zip.len() {
-        if let Ok(mut entry) = zip.by_index(i)
-            && entry.name() == "AndroidManifest.xml"
-        {
-            use std::io::Read;
-            let mut xml = String::new();
-            entry
-                .read_to_string(&mut xml)
-                .map_err(|e| fail(format!("unreadable AndroidManifest.xml: {e}")))?;
-            library_manifest = Some(xml);
-            break;
-        }
-    }
+    let library_manifest = read_archive_manifest(&archive);
     let package = library_manifest
         .as_deref()
         .and_then(manifest_package)
         .filter(|p| !p.is_empty());
-    drop(zip);
 
     let jars_dir = dir.join("jars");
     let _ = std::fs::remove_dir_all(&jars_dir);
@@ -587,14 +609,9 @@ pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
             .unwrap_or(true)
     });
 
-    let mut meta = String::new();
-    if let Some(p) = &package {
-        meta.push_str(&format!("package={p}\n"));
-    }
-    if let Some(m) = &manifest {
-        meta.push_str(&format!("manifest={m}\n"));
-    }
-    std::fs::write(dir.join(".cargo-rapk-lib-meta"), meta).map_err(|e| fail(e.to_string()))?;
+    // The marker alone identifies the cache entry; the manifest is re-read from
+    // the archive, so nothing else needs persisting.
+    let _ = std::fs::remove_file(dir.join(".cargo-rapk-lib-meta"));
     std::fs::write(&marker, coordinates.gav()).map_err(|e| fail(e.to_string()))?;
     Ok(ResolvedLib {
         coordinates,

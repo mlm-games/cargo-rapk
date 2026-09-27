@@ -159,8 +159,8 @@ impl ApkConfig {
     fn write_merged_manifest(&self) -> Result<(), NdkError> {
         let mut manifest = self.manifest.clone();
         for library in &self.library_manifests {
-            let library: AndroidManifest = quick_xml::de::from_str(library)
-                .map_err(|e| NdkError::LibraryManifestInvalid(e.to_string()))?;
+            let library = crate::manifest::parse_library_manifest(library)
+                .map_err(NdkError::LibraryManifestInvalid)?;
             manifest.merge_library(&library, &self.manifest.package);
         }
         manifest.write_to(&self.build_dir)
