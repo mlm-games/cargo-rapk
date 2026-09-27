@@ -138,8 +138,7 @@ exported = false
 #
 # No transitive resolution: list every artifact you need explicitly. An AAR that
 # depends on others (`GameActivity` needs `appcompat`) will fail to link until
-# its dependencies are listed too; a Gradle build is the better route for a
-# large dependency graph.
+# its dependencies are listed too. That is the trade. Gradle is more convenient for a large graph, not required.
 # `android_libs = ["org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"]
 android_libs = "org.example:some-library:1.2.3"
 
@@ -237,9 +236,8 @@ max_sdk_version = 18
 # See https://developer.android.com/guide/topics/manifest/queries-element#provider
 [[package.metadata.android.queries.provider]]
 authorities = "org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker"
-# Note: The `name` attribute is normally not required for a queries provider, but is non-optional
-# as a workaround for aapt throwing errors about missing `android:name` attribute.
-# This will be made optional if/when cargo-rapk migrates to aapt2.
+# `name` is optional and only needed for older cargo-rapk versions, which used
+# aapt v1 and required it on every provider.
 name = "org.khronos.openxr"
 
 # See https://developer.android.com/guide/topics/manifest/queries-element#intent

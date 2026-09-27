@@ -661,10 +661,13 @@ pub struct QueryProvider {
     #[serde(rename(serialize = "@android:authorities"))]
     pub authorities: String,
 
-    // The specs say only an `authorities` attribute is required for providers contained in a `queries` element
-    // however this is required for aapt support and should be made optional if/when cargo-rapk migrates to aapt2
-    #[serde(rename(serialize = "@android:name"))]
-    pub name: String,
+    // Optional per the spec, and aapt2 (which cargo-rapk now uses) accepts a
+    // provider without it. It was mandatory while the APK path ran aapt v1.
+    #[serde(
+        rename(serialize = "@android:name"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub name: Option<String>,
 }
 
 /// Android [provider element](https://developer.android.com/guide/topics/manifest/provider-element),
