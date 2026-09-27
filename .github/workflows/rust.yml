@@ -122,7 +122,9 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-${{ env.api-level }}
+          # Namespaced per matrix entry: the jobs run in parallel, and sharing
+          # one key lets them write and restore each other's AVD snapshots.
+          key: avd-${{ env.api-level }}-${{ env.arch }}-${{ matrix.source_os }}
 
       - name: create AVD and generate snapshot for caching
         if: steps.avd-cache.outputs.cache-hit != 'true'
@@ -139,6 +141,9 @@ jobs:
 
       - name: Start hello_world example
         id: emulator_run
+        # Keep going so the log artifact below is uploaded, but record the
+        # outcome: without this check a dead emulator is reported as a missing
+        # `~/logcat.log`, which says nothing about why.
         continue-on-error: true
         timeout-minutes: 10
         uses: reactivecircus/android-emulator-runner@v2
@@ -153,7 +158,15 @@ jobs:
           script: ./.github/workflows/android_test.sh "${{ steps.download.outputs.download-path }}"
 
       - name: Check test actually passed
-        run: grep -q 'hello world' ~/logcat.log
+        run: |
+          if [ "${{ steps.emulator_run.outcome }}" != "success" ]; then
+            echo "::error::The emulator run did not complete (outcome: ${{ steps.emulator_run.outcome }}). The emulator or adb failed; see the previous step's log."
+            exit 1
+          fi
+          if ! grep -q 'hello world' ~/logcat.log; then
+            echo "::error::'hello world' never reached logcat; the app did not start."
+            exit 1
+          fi
 
       - name: Upload emulator logs
         uses: actions/upload-artifact@v4

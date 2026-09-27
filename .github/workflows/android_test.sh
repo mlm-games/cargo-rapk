@@ -2,6 +2,11 @@
 
 set -ex
 
+# Create the log up front so it is uploaded even when the run dies before
+# logcat, which is what happens when the emulator itself never boots.
+LOG="${HOME}/logcat.log"
+: > "$LOG"
+
 # Make sure the package is removed since it may end up in the AVD cache. This causes
 # INSTALL_FAILED_UPDATE_INCOMPATIBLE errors when the debug keystore is regenerated,
 # as it is not stored/cached on the CI:
@@ -18,9 +23,9 @@ fi
 
 sleep 30
 
-adb logcat *:E hello_world:V -d | tee ~/logcat.log
+adb logcat *:E hello_world:V -d | tee "$LOG"
 
-if grep 'hello world' ~/logcat.log;
+if grep 'hello world' "$LOG";
 then
     echo "App running"
 else
@@ -36,7 +41,7 @@ if [ -n "$EMULATOR_PID" ]; then
     kill -9 "$EMULATOR_PID" 2>/dev/null || true
 fi
 
-ERROR_MSG=$(grep -e 'thread.*panicked at' "$HOME"/logcat.log | true)
+ERROR_MSG=$(grep -e 'thread.*panicked at' "$LOG" | true)
 if [ -z "${ERROR_MSG}" ];
 then
     exit 0
