@@ -27,6 +27,8 @@ pub mod libs;
 pub mod manifest;
 pub mod maven;
 pub mod ndk;
+pub mod pom;
+pub mod range;
 pub mod rustflags;
 pub mod target;
 pub mod version;

@@ -285,10 +285,11 @@ impl<'a> ApkBuilder<'a> {
         if !no_sources && let Err(e) = self.ndk.d8() {
             problems.push(format!("d8: {e}"));
         }
-        for lib in self.android_libs()? {
-            if let Err(e) = rndk::maven::ensure_lib(&lib) {
-                problems.push(e.to_string());
-            }
+        // The roots are resolved together, not one at a time: version choice is
+        // global, so resolving them separately can pick two versions of one
+        // artifact where resolving them together picks one.
+        if let Err(e) = rndk::maven::resolve_libs(&self.android_libs()?) {
+            problems.push(e.to_string());
         }
 
         if !kt_files.is_empty() {
@@ -344,14 +345,15 @@ impl<'a> ApkBuilder<'a> {
             }
             let libs = self.android_libs()?;
             if !libs.is_empty() {
-                let with_res = libs
+                let resolved = rndk::maven::resolve_libs(&libs)?;
+                let with_res = resolved
                     .iter()
-                    .filter_map(|lib| rndk::maven::ensure_lib(lib).ok())
                     .filter(|lib| lib.resources.is_some())
                     .count();
                 line.push_str(&format!(
-                    ", {} android_libs ({with_res} with resources)",
-                    libs.len()
+                    ", {} android_libs resolving to {} artifacts ({with_res} with resources)",
+                    libs.len(),
+                    resolved.len()
                 ));
             }
             println!("{line}");
@@ -520,8 +522,7 @@ impl<'a> ApkBuilder<'a> {
         let mut library_resources = Vec::new();
         let mut library_manifests = Vec::new();
         let mut r_libraries = Vec::new();
-        for lib in &android_libs {
-            let resolved = rndk::maven::ensure_lib(lib)?;
+        for resolved in rndk::maven::resolve_libs(&android_libs)? {
             lib_jars.extend(resolved.jars.iter().cloned());
             if let Some(res) = &resolved.resources {
                 library_resources.push(res.clone());

@@ -180,7 +180,7 @@ pub fn fetch_artifact_inner(
 }
 
 /// A `group:artifact:version` triple as written in `android_libs`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Coordinates {
     pub group: String,
     pub artifact: String,
@@ -211,6 +211,33 @@ impl Coordinates {
     pub fn gav(&self) -> String {
         format!("{}:{}:{}", self.group, self.artifact, self.version)
     }
+}
+
+/// Every artifact `gavs` reaches, fetched and ready for the classpath.
+///
+/// `android_libs` names direct dependencies; this follows their POMs so a
+/// library's own dependencies do not have to be listed by hand, and picks one
+/// version per artifact the way Maven does when two paths disagree.
+///
+/// The result is ordered by coordinates, so a build gets the same classpath
+/// twice.
+pub fn resolve_libs(gavs: &[String]) -> Result<Vec<ResolvedLib>, NdkError> {
+    let fail = |reason: String| NdkError::MavenLibFailed {
+        gav: if gavs.is_empty() {
+            "<none>".to_owned()
+        } else {
+            gavs.join(", ")
+        },
+        reason,
+    };
+    let roots = gavs
+        .iter()
+        .map(|gav| Coordinates::parse(gav).map_err(&fail))
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::pom::resolve(&roots)?
+        .iter()
+        .map(|resolved| ensure_lib(&resolved.coordinates.gav()))
+        .collect()
 }
 
 /// A resolved Android library.
@@ -526,7 +553,8 @@ fn read_resolved(dir: &Path, coordinates: Coordinates) -> Option<ResolvedLib> {
 /// Fetches (or reuses) one `android_libs` entry: its jars, `res/` tree and
 /// manifest, all cached under the artifact directory.
 ///
-/// Nothing is resolved transitively; every artifact has to be listed.
+/// This fetches one artifact. Use [`resolve_libs`] to walk the dependency graph
+/// as well.
 pub fn ensure_lib(gav: &str) -> Result<ResolvedLib, NdkError> {
     let coordinates = Coordinates::parse(gav).map_err(|reason| NdkError::MavenLibFailed {
         gav: gav.to_owned(),
