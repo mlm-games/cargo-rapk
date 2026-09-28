@@ -1,5 +1,7 @@
 use crate::error::NdkError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
@@ -7,6 +9,10 @@ use std::path::Path;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename = "manifest")]
 pub struct AndroidManifest {
+    /// Repositories to fetch `android_libs` from, ahead of Google Maven and
+    /// Maven Central. Absent, both of those are searched in that order.
+    #[serde(skip)]
+    pub maven_repositories: Option<Vec<crate::maven::Repository>>,
     #[serde(rename(serialize = "@xmlns:android"))]
     #[serde(default = "default_namespace")]
     ns_android: String,
@@ -61,6 +67,7 @@ pub struct AndroidManifest {
 impl Default for AndroidManifest {
     fn default() -> Self {
         Self {
+            maven_repositories: None,
             ns_android: default_namespace(),
             package: Default::default(),
             shared_user_id: Default::default(),
@@ -96,6 +103,7 @@ impl AndroidManifest {
             let permission = Permission {
                 name: substitute_application_id(&permission.name, application_id),
                 max_sdk_version: permission.max_sdk_version,
+                protection_level: None,
             };
             if !self
                 .uses_permission
@@ -110,9 +118,28 @@ impl AndroidManifest {
             let permission = Permission {
                 name: substitute_application_id(&permission.name, application_id),
                 max_sdk_version: permission.max_sdk_version,
+                protection_level: permission.protection_level.clone(),
             };
             if !self.permission.iter().any(|p| p.name == permission.name) {
                 self.permission.push(permission);
+            }
+        }
+
+        // The app's own factory wins: there can only be one, and it is the one
+        // that has to instantiate the app's components.
+        if self.application.app_component_factory.is_none() {
+            self.application.app_component_factory =
+                library.application.app_component_factory.clone();
+        }
+
+        for uses_library in &library.application.uses_library {
+            if !self
+                .application
+                .uses_library
+                .iter()
+                .any(|u| u.name == uses_library.name)
+            {
+                self.application.uses_library.push(uses_library.clone());
             }
         }
 
@@ -298,6 +325,21 @@ fn substitute_application_id(value: &str, application_id: &str) -> String {
         .replace("${applicationIdSuffix}", "")
 }
 
+/// A library's manifest, and what of it is not modelled.
+///
+/// Dropping part of a library's manifest is not a cosmetic loss: the parts
+/// dropped are the parts a device reads back at install or launch time, so an
+/// unmodelled `uses-permission` or `service` produces an app that installs and
+/// then fails. A build therefore reports what it could not carry over rather
+/// than shipping the gap silently.
+#[derive(Clone, Debug, Default)]
+pub struct LibraryManifest {
+    pub manifest: AndroidManifest,
+    /// A human-readable note per element or attribute that was declared and
+    /// not modelled, sorted and deduplicated.
+    pub unmodelled: Vec<String>,
+}
+
 /// Reads a library manifest into the subset that [`AndroidManifest::merge_library`]
 /// folds into the app's.
 ///
@@ -307,48 +349,85 @@ fn substitute_application_id(value: &str, application_id: &str) -> String {
 /// `@android:name` never sees the `android:name` in the document — it silently
 /// reads as absent. The event reader's `local_name()` does drop the prefix, so
 /// attributes are read here by hand. Serde still does all the writing.
-pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
+pub fn parse_library_manifest(xml: &str) -> Result<LibraryManifest, String> {
     use quick_xml::events::Event;
 
-    fn attributes(start: &quick_xml::events::BytesStart) -> Result<Vec<(String, String)>, String> {
-        let mut out = Vec::new();
+    /// An element's attributes, remembering which have been asked for so that
+    /// whatever is left over can be reported. Reading is done through this type
+    /// rather than a `Vec`, so a newly read attribute is accounted for by
+    /// construction and the report cannot drift from the parser.
+    struct Attrs {
+        pairs: Vec<(String, String)>,
+        read: RefCell<BTreeSet<String>>,
+    }
+
+    impl Attrs {
+        fn get(&self, name: &str) -> Option<&str> {
+            self.read.borrow_mut().insert(name.to_owned());
+            self.pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        }
+
+        /// The attribute names nothing asked for.
+        fn unread(&self) -> Vec<&str> {
+            let read = self.read.borrow();
+            self.pairs
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .filter(|key| !read.contains(*key))
+                .collect()
+        }
+    }
+
+    fn attributes(start: &quick_xml::events::BytesStart) -> Result<Attrs, String> {
+        let mut pairs = Vec::new();
+        let mut read = BTreeSet::new();
         for attr in start.attributes().with_checks(false) {
             let attr = attr.map_err(|e| e.to_string())?;
             let key = String::from_utf8_lossy(attr.key.local_name().as_ref()).into_owned();
-            out.push((
+            // `xmlns:` declares a namespace and `tools:` is a build-time
+            // directive. Neither is application state, so neither is reported
+            // as lost, though `tools:node` is still read by its local name.
+            let prefix: Option<Vec<u8>> = attr.key.prefix().map(|p| p.as_ref().to_vec());
+            if matches!(prefix.as_deref(), Some(b"xmlns" | b"tools")) {
+                read.insert(key.clone());
+            }
+            pairs.push((
                 key,
                 attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                     .map_err(|e| e.to_string())?
                     .into_owned(),
             ));
         }
-        Ok(out)
+        Ok(Attrs {
+            pairs,
+            read: RefCell::new(read),
+        })
     }
 
-    fn get<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
-        attrs
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
+    fn get<'a>(attrs: &'a Attrs, name: &str) -> Option<&'a str> {
+        attrs.get(name)
     }
 
-    fn flag(attrs: &[(String, String)], name: &str) -> Option<bool> {
+    fn flag(attrs: &Attrs, name: &str) -> Option<bool> {
         get(attrs, name).and_then(|v| v.parse().ok())
     }
 
-    fn enabled(attrs: &[(String, String)]) -> Option<Enabled> {
+    fn enabled(attrs: &Attrs) -> Option<Enabled> {
         get(attrs, "enabled").map(Enabled::parse)
     }
 
-    fn number(attrs: &[(String, String)], name: &str) -> Option<u32> {
+    fn number(attrs: &Attrs, name: &str) -> Option<u32> {
         get(attrs, name).and_then(|v| v.parse().ok())
     }
 
-    fn named(attrs: &[(String, String)]) -> String {
+    fn named(attrs: &Attrs) -> String {
         get(attrs, "name").unwrap_or_default().to_owned()
     }
 
-    fn meta_data(attrs: &[(String, String)]) -> MetaData {
+    fn meta_data(attrs: &Attrs) -> MetaData {
         MetaData {
             name: named(attrs),
             value: get(attrs, "value").map(str::to_owned),
@@ -356,7 +435,7 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
         }
     }
 
-    fn intent_filter_attrs(attrs: &[(String, String)]) -> Vec<String> {
+    fn intent_filter_attrs(attrs: &Attrs) -> Vec<String> {
         get(attrs, "name")
             .map(|n| vec![n.to_owned()])
             .unwrap_or_default()
@@ -372,6 +451,7 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
     let mut receiver: Option<Receiver> = None;
     let mut filter: Option<IntentFilter> = None;
     let mut queries: Option<Queries> = None;
+    let mut unmodelled: BTreeSet<String> = BTreeSet::new();
 
     loop {
         let (name, attrs, is_start) = match reader.read_event() {
@@ -453,15 +533,38 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
         let parent = path.last().map(String::as_str).unwrap_or_default();
 
         match (parent, name.as_str()) {
-            ("", "manifest") => manifest.package = named(&attrs),
+            ("", "manifest") => {
+                // The library's own identity and version, which the app's
+                // supersede and so are read only to be accounted for.
+                get(&attrs, "package");
+                get(&attrs, "versionCode");
+                get(&attrs, "versionName");
+            }
             ("manifest", "uses-permission") => manifest.uses_permission.push(Permission {
                 name: named(&attrs),
                 max_sdk_version: number(&attrs, "maxSdkVersion"),
+                protection_level: None,
             }),
             ("manifest", "permission") => manifest.permission.push(Permission {
                 name: named(&attrs),
                 max_sdk_version: number(&attrs, "maxSdkVersion"),
+                protection_level: get(&attrs, "protectionLevel").map(str::to_owned),
             }),
+            ("manifest", "uses-sdk") => {
+                get(&attrs, "minSdkVersion");
+                get(&attrs, "targetSdkVersion");
+            }
+            // A container that is descended into but carries nothing to merge.
+            ("manifest", "application") => {
+                manifest.application.app_component_factory =
+                    get(&attrs, "appComponentFactory").map(str::to_owned);
+            }
+            ("application", "uses-library") => {
+                manifest.application.uses_library.push(UsesLibrary {
+                    name: named(&attrs),
+                    required: flag(&attrs, "required"),
+                })
+            }
             ("manifest", "queries") if is_start => queries = Some(Queries::default()),
             ("queries", "package") => {
                 if let Some(q) = queries.as_mut() {
@@ -498,6 +601,10 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     orientation: get(&attrs, "screenOrientation").map(str::to_owned),
                     exported: flag(&attrs, "exported"),
                     enabled: enabled(&attrs),
+                    theme: get(&attrs, "theme").map(str::to_owned),
+                    exclude_from_recents: flag(&attrs, "excludeFromRecents"),
+                    fits_system_windows: flag(&attrs, "fitsSystemWindows"),
+                    state_not_needed: flag(&attrs, "stateNotNeeded"),
                     resizeable_activity: flag(&attrs, "resizeableActivity"),
                     always_retain_task_state: flag(&attrs, "alwaysRetainTaskState"),
                     tools_node: get(&attrs, "node").map(str::to_owned),
@@ -515,12 +622,18 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     a.meta_data.push(meta_data(&attrs));
                 }
             }
-            ("activity", "intent-filter") if is_start => filter = Some(IntentFilter::default()),
+            ("activity", "intent-filter") if is_start => {
+                filter = Some(IntentFilter {
+                    priority: number(&attrs, "priority"),
+                    ..Default::default()
+                })
+            }
             ("application", "service") => {
                 let built = Service {
                     name: named(&attrs),
                     exported: flag(&attrs, "exported"),
                     enabled: enabled(&attrs),
+                    visible_to_instant_apps: flag(&attrs, "visibleToInstantApps"),
                     foreground_service_type: get(&attrs, "foregroundServiceType")
                         .map(str::to_owned),
                     label: get(&attrs, "label").map(str::to_owned),
@@ -544,7 +657,12 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     s.meta_data.push(meta_data(&attrs));
                 }
             }
-            ("service", "intent-filter") if is_start => filter = Some(IntentFilter::default()),
+            ("service", "intent-filter") if is_start => {
+                filter = Some(IntentFilter {
+                    priority: number(&attrs, "priority"),
+                    ..Default::default()
+                })
+            }
             ("application", "meta-data") => manifest.application.meta_data.push(meta_data(&attrs)),
             ("application", "provider") => {
                 let built = Provider {
@@ -556,6 +674,7 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     multiprocess: flag(&attrs, "multiprocess"),
                     process: get(&attrs, "process").map(str::to_owned),
                     grant_uri_permissions: flag(&attrs, "grantUriPermissions"),
+                    direct_boot_aware: flag(&attrs, "directBootAware"),
                     tools_node: get(&attrs, "node").map(str::to_owned),
                     meta_data: Vec::new(),
                 };
@@ -595,7 +714,10 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                 }
             }
             ("receiver", "intent-filter") | ("queries", "intent") if is_start => {
-                filter = Some(IntentFilter::default())
+                filter = Some(IntentFilter {
+                    priority: number(&attrs, "priority"),
+                    ..Default::default()
+                })
             }
             ("intent-filter", "action") => {
                 if let Some(f) = filter.as_mut() {
@@ -607,7 +729,30 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
                     f.categories.extend(intent_filter_attrs(&attrs));
                 }
             }
-            _ => {}
+            ("intent-filter", "data") => {
+                if let Some(f) = filter.as_mut() {
+                    f.data.push(IntentFilterData {
+                        scheme: get(&attrs, "scheme").map(str::to_owned),
+                        host: get(&attrs, "host").map(str::to_owned),
+                        port: get(&attrs, "port").map(str::to_owned),
+                        path: get(&attrs, "path").map(str::to_owned),
+                        path_pattern: get(&attrs, "pathPattern").map(str::to_owned),
+                        path_prefix: get(&attrs, "pathPrefix").map(str::to_owned),
+                        path_suffix: get(&attrs, "pathSuffix").map(str::to_owned),
+                        path_advanced_pattern: get(&attrs, "pathAdvancedPattern")
+                            .map(str::to_owned),
+                        mime_type: get(&attrs, "mimeType").map(str::to_owned),
+                    });
+                }
+            }
+            // An element nothing claimed is not modelled, so say which rather
+            // than let the app launch without it.
+            _ => {
+                unmodelled.insert(format!("<{parent}/{name}>"));
+            }
+        }
+        for key in attrs.unread() {
+            unmodelled.insert(format!("<{parent}/{name}> attribute `{key}`"));
         }
 
         if is_start {
@@ -630,7 +775,10 @@ pub fn parse_library_manifest(xml: &str) -> Result<AndroidManifest, String> {
     if let Some(q) = queries.take() {
         manifest.queries = Some(q);
     }
-    Ok(manifest)
+    Ok(LibraryManifest {
+        manifest,
+        unmodelled: unmodelled.into_iter().collect(),
+    })
 }
 
 /// Android [application element](https://developer.android.com/guide/topics/manifest/application-element), containing one or more [`Activity`] and [`Service`] elements.
@@ -686,6 +834,14 @@ pub struct Application {
     #[serde(rename(serialize = "meta-data"))]
     #[serde(default)]
     pub meta_data: Vec<MetaData>,
+    #[serde(
+        rename(serialize = "@android:appComponentFactory"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub app_component_factory: Option<String>,
+    #[serde(rename(serialize = "uses-library"))]
+    #[serde(default)]
+    pub uses_library: Vec<UsesLibrary>,
     #[serde(default = "default_activities")]
     #[serde(deserialize_with = "deserialize_activities")]
     pub activity: Vec<Activity>,
@@ -719,6 +875,8 @@ impl Default for Application {
             allow_native_heap_pointer_tagging: None,
             install_location: None,
             meta_data: Vec::new(),
+            app_component_factory: None,
+            uses_library: Vec::new(),
             activity: default_activities(),
             service: Vec::new(),
             receiver: Vec::new(),
@@ -794,6 +952,26 @@ pub struct Activity {
     )]
     pub enabled: Option<Enabled>,
     #[serde(
+        rename(serialize = "@android:theme"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub theme: Option<String>,
+    #[serde(
+        rename(serialize = "@android:excludeFromRecents"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exclude_from_recents: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:fitsSystemWindows"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fits_system_windows: Option<bool>,
+    #[serde(
+        rename(serialize = "@android:stateNotNeeded"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state_not_needed: Option<bool>,
+    #[serde(
         rename(serialize = "@android:resizeableActivity"),
         skip_serializing_if = "Option::is_none"
     )]
@@ -823,6 +1001,10 @@ impl Default for Activity {
             orientation: None,
             exported: None,
             enabled: None,
+            theme: None,
+            exclude_from_recents: None,
+            fits_system_windows: None,
+            state_not_needed: None,
             resizeable_activity: None,
             always_retain_task_state: None,
             tools_node: None,
@@ -853,6 +1035,11 @@ pub struct Service {
         skip_serializing_if = "Option::is_none"
     )]
     pub enabled: Option<Enabled>,
+    #[serde(
+        rename(serialize = "@android:visibleToInstantApps"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub visible_to_instant_apps: Option<bool>,
     #[serde(
         rename(serialize = "@android:foregroundServiceType"),
         skip_serializing_if = "Option::is_none"
@@ -1075,6 +1262,11 @@ pub struct IntentFilter {
     pub categories: Vec<String>,
     #[serde(default)]
     pub data: Vec<IntentFilterData>,
+    #[serde(
+        rename(serialize = "@android:priority"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub priority: Option<u32>,
 }
 
 fn serialize_actions<S>(actions: &[String], serializer: S) -> Result<S::Ok, S::Error>
@@ -1151,6 +1343,16 @@ pub struct IntentFilterData {
         skip_serializing_if = "Option::is_none"
     )]
     pub path_prefix: Option<String>,
+    #[serde(
+        rename(serialize = "@android:pathSuffix"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub path_suffix: Option<String>,
+    #[serde(
+        rename(serialize = "@android:pathAdvancedPattern"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub path_advanced_pattern: Option<String>,
     #[serde(
         rename(serialize = "@android:mimeType"),
         skip_serializing_if = "Option::is_none"
@@ -1239,6 +1441,25 @@ pub struct Permission {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_sdk_version: Option<u32>,
+    /// A `signature`-level permission dropped here becomes a `normal` one,
+    /// which any app on the device can then hold.
+    #[serde(
+        rename(serialize = "@android:protectionLevel"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub protection_level: Option<String>,
+}
+
+/// Android [uses-library element](https://developer.android.com/guide/topics/manifest/uses-library-element).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct UsesLibrary {
+    #[serde(rename(serialize = "@android:name"))]
+    pub name: String,
+    #[serde(
+        rename(serialize = "@android:required"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required: Option<bool>,
 }
 
 /// Android [grant-uri-permission element](https://developer.android.com/guide/topics/manifest/grant-uri-permission-element).
@@ -1297,6 +1518,11 @@ pub struct Provider {
         skip_serializing_if = "Option::is_none"
     )]
     pub enabled: Option<Enabled>,
+    #[serde(
+        rename(serialize = "@android:directBootAware"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub direct_boot_aware: Option<bool>,
     #[serde(
         rename(serialize = "@android:initOrder"),
         skip_serializing_if = "Option::is_none"
@@ -1456,7 +1682,9 @@ mod library_manifest_tests {
 </manifest>"#;
 
     fn merged() -> AndroidManifest {
-        let library = parse_library_manifest(LIBRARY).expect("library parses");
+        let library = parse_library_manifest(LIBRARY)
+            .expect("library parses")
+            .manifest;
         let mut app = AndroidManifest {
             package: "com.example.app".into(),
             ..Default::default()
@@ -1540,7 +1768,8 @@ mod library_manifest_tests {
                  </application>
                </manifest>"#,
         )
-        .unwrap();
+        .unwrap()
+        .manifest;
         let mut app = AndroidManifest::default();
         app.merge_library(&library, "com.example.app");
         let activity = app
@@ -1584,7 +1813,8 @@ mod library_manifest_tests {
                  <uses-feature android:glEsVersion="0x00030000" android:required="true" />
                </manifest>"#,
         )
-        .unwrap();
+        .unwrap()
+        .manifest;
         assert_eq!(app.uses_feature[0].opengles_version, Some((3, 0)));
         assert_eq!(app.uses_feature[0].required, Some(true));
     }
@@ -1657,7 +1887,8 @@ mod library_manifest_tests {
                  </application>
                </manifest>"#,
         )
-        .unwrap();
+        .unwrap()
+        .manifest;
         let mut app = AndroidManifest {
             package: "com.example.app".into(),
             ..Default::default()

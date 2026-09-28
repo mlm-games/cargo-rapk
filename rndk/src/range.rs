@@ -126,6 +126,33 @@ pub enum Requirement {
     Latest,
     /// The most recent non-snapshot version.
     Release,
+    /// A requirement that also names versions it will not accept, which is GMM's
+    /// `rejects`. Gradle enforces these: `DefaultResolvedVersionConstraint
+    /// .accepts` filters a candidate through `rejectedVersionsSelector`, and a
+    /// static version is rejected too, so a module published only at a rejected
+    /// version fails the build rather than being used.
+    Rejecting {
+        base: Box<Requirement>,
+        rejects: Vec<MavenVersion>,
+    },
+}
+
+impl Requirement {
+    /// A requirement carrying a set of rejected versions, as GMM's `rejects`
+    /// does.
+    pub fn rejecting(spec: &str, rejects: &[String]) -> Self {
+        let base = Self::parse(spec);
+        if rejects.is_empty() {
+            return base;
+        }
+        Self::Rejecting {
+            base: Box::new(base),
+            rejects: rejects
+                .iter()
+                .map(|v| MavenVersion::new(v.trim()))
+                .collect(),
+        }
+    }
 }
 
 impl fmt::Display for Bound {
@@ -181,6 +208,11 @@ impl fmt::Display for Requirement {
             Self::Range(range) => write!(f, "{range}"),
             Self::Latest => f.write_str("LATEST"),
             Self::Release => f.write_str("RELEASE"),
+            Self::Rejecting { base, rejects } => {
+                write!(f, "{base} rejecting ")?;
+                let list: Vec<String> = rejects.iter().map(|v| v.to_string()).collect();
+                f.write_str(&list.join(", "))
+            }
         }
     }
 }
@@ -215,6 +247,23 @@ impl Requirement {
     /// requirement needs: an exact version is taken as written, and a missing
     /// artifact then fails at download with a message naming it.
     pub fn resolve(&self, available: &[MavenVersion]) -> Option<MavenVersion> {
+        if let Self::Rejecting { base, rejects } = self {
+            // An exact version that is rejected leaves no acceptable version at
+            // all. Filtering the candidate list and then resolving the base is
+            // what lets a range fall back to the next newest rather than to
+            // nothing, which is the whole point of a published rejection.
+            if let Self::Exact(version) = base.as_ref()
+                && rejects.iter().any(|rejected| rejected == version)
+            {
+                return None;
+            }
+            let allowed: Vec<MavenVersion> = available
+                .iter()
+                .filter(|candidate| !rejects.iter().any(|rejected| rejected == *candidate))
+                .cloned()
+                .collect();
+            return base.resolve(&allowed);
+        }
         match self {
             Self::Exact(version) => Some(version.clone()),
             Self::Soft(version) => available
@@ -234,6 +283,7 @@ impl Requirement {
                 .filter(|candidate| !is_snapshot(candidate.as_str()))
                 .max()
                 .cloned(),
+            Self::Rejecting { .. } => None,
         }
     }
 }

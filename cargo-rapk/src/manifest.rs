@@ -25,6 +25,10 @@ pub(crate) struct Manifest {
     pub(crate) java_sources: Vec<PathBuf>,
     /// `group:artifact:version` Maven coordinates added to the dex.
     pub(crate) android_libs: Vec<String>,
+    /// Repositories `android_libs` is fetched from, ahead of Google Maven and
+    /// Maven Central. A secret belongs in an environment variable, referenced
+    /// here as `${NAME}`, rather than in `Cargo.toml`.
+    pub(crate) maven_repositories: Option<Vec<rndk::maven::Repository>>,
     pub(crate) runtime_libs: Option<PathBuf>,
     /// Maps profiles to keystores
     pub(crate) signing: HashMap<String, Signing>,
@@ -57,6 +61,7 @@ impl Manifest {
             resources: metadata.resources,
             java_sources: metadata.java_sources,
             android_libs: metadata.android_libs,
+            maven_repositories: metadata.maven_repositories,
             runtime_libs: metadata.runtime_libs,
             signing: metadata.signing,
             reverse_port_forward: metadata.reverse_port_forward,
@@ -118,6 +123,11 @@ struct AndroidMetadata {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_one_or_many")]
     android_libs: Vec<String>,
+    /// Repositories `android_libs` is fetched from, ahead of Google Maven and
+    /// Maven Central. A secret is best given as an environment variable and
+    /// referenced as `${NAME}`, so it stays out of `Cargo.toml`.
+    #[serde(default)]
+    maven_repositories: Option<Vec<rndk::maven::Repository>>,
     runtime_libs: Option<PathBuf>,
     /// Maps profiles to keystores
     #[serde(default)]

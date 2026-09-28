@@ -640,6 +640,24 @@ impl Ndk {
         Ok(())
     }
 
+    /// The major Java version of the JDK this build will use, from
+    /// `java.specification.version`.
+    pub fn java_version() -> Option<u32> {
+        let out = Command::new(Self::java_tool_path("java").ok()?)
+            .arg("-XshowSettings:properties")
+            .arg("-version")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stderr);
+        let value = text.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "java.specification.version").then(|| value.trim().to_owned())
+        })?;
+        // Java 8 and earlier report `1.8`.
+        let major = value.strip_prefix("1.").unwrap_or(&value);
+        major.split(['.', '-']).next()?.parse().ok()
+    }
+
     pub fn android_user_home(&self) -> Result<PathBuf, NdkError> {
         let android_user_home = self.user_home.clone();
         create_dir_all(&android_user_home)?;

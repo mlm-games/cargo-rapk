@@ -564,6 +564,7 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
             &dep.artifact,
             &dep.version,
             "pom",
+            None,
             true,
         ) {
             Ok(Some(p)) => p,
@@ -577,7 +578,7 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
         for t in parse_pom_deps(&xml) {
             let key = (t.group.clone(), t.artifact.clone(), t.version.clone());
             if seen.insert(key)
-                && fetch_artifact_inner(&dir, &t.group, &t.artifact, &t.version, "jar", true)
+                && fetch_artifact_inner(&dir, &t.group, &t.artifact, &t.version, "jar", None, true)
                     .map_err(&fail)?
                     .is_none()
             {

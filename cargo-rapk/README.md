@@ -123,11 +123,30 @@ exported = false
 # `CARGO_RAPK_FETCH_KOTLIN=never|force`, `CARGO_RAPK_NO_FETCH_KOTLIN=1`.
 
 # Maven `group:artifact:version` coordinates to add to the APK's dex and to
-# the `javac`/`kotlinc` classpath. `androidx.*` and `com.android.*` resolve
-# against Google's Maven, everything else against Maven Central. Downloads are
-# `.sha1`-verified and cached in
+# the `javac`/`kotlinc` classpath. Google's Maven is searched first and Maven
+# Central second, so an artifact is found wherever it happens to be published;
+# a `.sha1` sidecar is verified when the repository publishes one, and a
+# mismatch fails. Downloads are cached in
 # `$XDG_CACHE_HOME/cargo-rapk/maven/<group>/<artifact>/<version>`; pins are
 # `CARGO_RAPK_FETCH_MAVEN=never|force` and `CARGO_RAPK_NO_FETCH_MAVEN=1`.
+#
+# To fetch from somewhere else, list the repositories in order. A secret
+# belongs in an environment variable rather than here.
+#
+#   [[package.metadata.android.maven_repositories]]
+#   url = "https://maven.internal.example.com/repo"
+#   token = "${INTERNAL_MAVEN_TOKEN}"
+#   include_groups = ["com.internal"]
+#   exclude_groups = ["com.internal.legacy"]
+#   username = "build"
+#   password = "${INTERNAL_MAVEN_PASSWORD}"
+#
+# A global mirror is `CARGO_RAPK_MAVEN_GOOGLE` or `CARGO_RAPK_MAVEN_CENTRAL`;
+# `CARGO_RAPK_MAVEN_REPOSITORIES` takes the same list as TOML.
+#
+# A token or password here is handed to `curl` on its standard input rather
+# than as an argument, so it does not appear in `/proc/<pid>/cmdline` for the
+# life of the download.
 #
 # An AAR's `res/` is compiled with `aapt2` and linked as an overlay alongside
 # the app's own `resources`. A per-library `R` class is generated from the same
@@ -137,23 +156,72 @@ exported = false
 # Transitive resolution follows POMs and Gradle Module Metadata, so a single
 # entry pulls its closure: `androidx.appcompat:appcompat:1.7.0` resolves 43
 # artifacts. GMM is used when published, which is how a Kotlin Multiplatform
-# root is redirected to its `-jvm` variant. When two paths want different
-# versions of one artifact the newest wins, whatever its distance, matching
-# Gradle; a hard range the winner cannot satisfy is reported as a warning.
+# root is redirected to its `-jvm` variant, and its variant selection honours
+# `org.gradle.jvm.version` against the JDK the build uses. When two paths want
+# different versions of one artifact the newest wins, whatever its distance, as
+# Gradle does. A hard range the winner cannot satisfy is reported as a warning
+# rather than failing; Gradle fails, and this differs deliberately, because a
+# skewed patch level is routine in the AndroidX POM set and failing on it would
+# make whole libraries unusable. A GMM `rejects` list is obeyed, not merely
+# recorded, so a module published only at a rejected version is not selected.
 # Maven artifacts at a given version are immutable, so resolution is
 # reproducible from the pins alone and no lockfile is written.
 #
-# Resolution can only follow published metadata. An artifact whose POM declares
-# no dependencies and publishes no `.module` resolves to nothing else, so
-# `androidx.games:games-activity` has to be listed alongside the libraries it
-# needs (`androidx.appcompat`); its own metadata names none.
+# A platform coordinates versions for the whole graph rather than adding a jar,
+# and it moves an artifact another path already put on the classpath. That is
+# how a family of modules that must agree is reconciled, and it is the fix for
+# the one resolution cannot reach — `kotlin-stdlib` 1.8 absorbed the
+# `jdk7`/`jdk8` internals, so a stale `kotlin-stdlib-jdk7:1.6.21` contributes
+# classes `kotlin-stdlib:1.8.22` already has:
 #
-# Merged into the app manifest: permissions, permission declarations,
-# `meta-data`, `uses-feature`, `grant-uri-permission`, and `activity`,
-# `service`, `receiver` and `provider` with their intent filters. A library's
+#   android_libs = [
+#     "org.jetbrains.kotlin:kotlin-bom:1.8.22!platform",
+#     "androidx.appcompat:appcompat:1.7.0",
+#   ]
+#
+# Without that the build stops before `d8` runs, naming each duplicated class
+# and the two artifacts that define it.
+#
+# The role is a property of the entry, never of the module: Gradle reads it off
+# `platform("...")` and applies no `<dependencyManagement>` to a module named as
+# an ordinary dependency, whereas `<packaging>` cannot say which was meant. An
+# unmarked entry is therefore guessed — a `pom`-packaged module carrying a
+# `<dependencyManagement>` is treated as a platform — and the marker overrides
+# the guess either way. `!platform` makes an entry a platform whatever its
+# packaging, and `!library` makes it a library: its dependencies are resolved
+# and its management is not applied to the graph, which is what a `pom`
+# aggregator named as an ordinary dependency gets in Gradle.
+#
+# A relocated module ships nothing of its own; the coordinates that replaced it
+# are resolved as a module in their own right, so `g:old` pointing at `g:new`
+# and `g:old` at a version that was never relocated cannot both end up in one
+# APK. A relocation to another version of the same coordinates is refused,
+# because that names a module that publishes nothing under its own name.
+#
+# A build also stops when a library's own `uses-sdk` asks for a higher
+# `minSdkVersion` than the app declares, since nothing would enforce it until
+# the app failed on an older device.
+#
+# Resolution can only follow published metadata, and some of it is thin.
+# `androidx.games:games-activity` declares no dependencies and publishes no
+# `.module`, so it resolves to its own single AAR — which is all it needs, as
+# the AAR carries no reference to anything outside itself. A module whose
+# metadata is incomplete is a limitation of the published POM, not something
+# resolution can work around.
+#
+# Merged into the app manifest: permissions, permission declarations (with
+# `android:protectionLevel`, so a `signature` permission does not silently
+# become a `normal` one), `meta-data`, `uses-feature` including
+# `android:glEsVersion`, `grant-uri-permission`, `uses-library`, and `activity`,
+# `service`, `receiver` and `provider` with their themes, `directBootAware`,
+# and intent filters including their `<data>` deep links and `android:priority`.
+# The app's own `appComponentFactory` wins over a library's. A library's
 # `tools:node="remove"` drops its element and `tools:node="replace"` overrides
 # the app's; otherwise the app's own declaration wins. A library's `package`,
 # version, icon, label and theme are dropped, as those belong to the app.
+# Anything declared that is not modelled is reported rather than dropped
+# silently, since a dropped element is one the device is asked to honour and
+# does not find.
 # `android_libs = ["org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"]
 android_libs = "org.example:some-library:1.2.3"
 

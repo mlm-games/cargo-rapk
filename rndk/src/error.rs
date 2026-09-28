@@ -65,10 +65,28 @@ pub enum NdkError {
     TimestampOutOfRange(i64),
     #[error("Failed to read or rewrite the zip archive: {0}")]
     Zip(#[from] zip::result::ZipError),
+    #[error(
+        "an `android_libs` entry needs Android {required} but the app declares \
+         minSdkVersion {app}, so it would fail on an older device: {libraries}. Raise \
+         minSdkVersion, or drop that library."
+    )]
+    LibraryMinSdkTooHigh {
+        required: u32,
+        app: u32,
+        libraries: String,
+    },
     #[error("Environment variable `{0}` contains non-unicode characters")]
     NonUnicodeEnvVar(&'static str),
     #[error("Command `{}` had a non-zero exit code.", format!("{:?}", .0).replace('"', ""))]
     CmdFailed(Box<Command>),
+    #[error(
+        "{count} class(es) are defined by more than one `android_libs` artifact, so `d8` \
+         cannot dex them. Reconcile it the way Gradle does: name one version for the whole \
+         family in `android_libs`, or add the platform that coordinates them, such as \
+         `org.jetbrains.kotlin:kotlin-bom`.{classes}",
+        count = .count
+    )]
+    DuplicateClasses { count: usize, classes: String },
     #[error("Failed to fetch Kotlin compiler v{version}: {reason}")]
     KotlinFetchFailed { version: String, reason: String },
     #[error("Kotlin zip SHA256 mismatch: expected {expected}, got {actual}")]

@@ -169,7 +169,9 @@ fn iterator_single_item<T>(mut iter: impl Iterator<Item = T>) -> Option<T> {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    // `warn` rather than the `error` that `env_logger` defaults to: the
+    // diagnostics worth seeing are warnings. `RUST_LOG` still wins.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let Cmd {
         apk: RapkCmd::Rapk { cmd },

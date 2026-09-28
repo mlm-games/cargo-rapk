@@ -99,6 +99,14 @@ struct Declaration {
     scope: Scope,
     optional: bool,
     exclusions: Vec<Exclusion>,
+    /// Which file to fetch for this module, for a dependant whose metadata
+    /// says so and whose own does not.
+    artifact_selector: Option<gmm::ArtifactSelector>,
+    /// `<type>test-jar</type>`, a test fixture rather than a library.
+    test_artifact: bool,
+    /// Versions the declaring module will not accept, which Gradle filters a
+    /// candidate through rather than merely records.
+    rejects: Vec<String>,
 }
 
 /// A version pinned by `dependencyManagement`, which applies to the
@@ -121,6 +129,16 @@ struct Model {
     properties: BTreeMap<String, String>,
     management: BTreeMap<ModuleId, Managed>,
     dependencies: Vec<Declaration>,
+}
+
+impl Model {
+    fn imports_in_order(&self) -> Vec<ModuleId> {
+        self.management
+            .iter()
+            .filter(|(_, managed)| managed.bom)
+            .map(|(module, _)| module.clone())
+            .collect()
+    }
 }
 
 /// POM elements carry no namespace prefix — a POM only declares `xmlns:` on
@@ -187,6 +205,9 @@ struct Dependency {
     artifact_id: String,
     #[serde(rename = "version", default)]
     version: Option<String>,
+    /// `<type>`. Read to recognise a `test-jar`, which is a test artifact even
+    /// when its scope says compile; every other value is the module's own
+    /// artifact.
     #[serde(rename = "type", default)]
     kind: Option<String>,
     #[serde(rename = "scope", default)]
@@ -246,6 +267,9 @@ struct Selection {
     ordering: MavenVersion,
     depth: usize,
     order: usize,
+    /// The exclusions in force where this module was reached, so that a later
+    /// claim on it expands it under the same rules rather than none.
+    excluded: Vec<Exclusion>,
     /// The requirement that produced this version, so that a hard range it
     /// arrived under can be checked against the version that finally wins.
     requirement: Requirement,
@@ -313,12 +337,26 @@ fn redirect_of(module: &gmm::Module, coordinates: &Coordinates) -> Option<Coordi
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub coordinates: Coordinates,
-    /// `pom` artifacts are BOMs and are never packaged, so they are left out
-    /// of the closure.
     pub packaging: String,
     /// The archive to fetch, when the metadata named one. `None` probes for an
     /// AAR and then a jar, which is all a POM can tell us.
     pub extension: Option<String>,
+    /// The classifier the archive is published under, when a dependency's
+    /// `thirdPartyCompatibility.artifactSelector` names one. Maven publishes
+    /// these as `{artifact}-{version}-{classifier}.{extension}`, and without it
+    /// a platform-specific or native artifact resolves to the wrong bytes or to
+    /// nothing at all.
+    pub classifier: Option<String>,
+    /// A `pom`-packaged module's own jar, which Maven says is never published
+    /// and Gradle probes for anyway.
+    ///
+    /// `RealisedMavenModuleResolveMetadata.getArtifactsForConfiguration` offers
+    /// it as an `optionalArtifact`, so a repository that publishes one has it
+    /// on the classpath and a repository that does not is not an error. Maven
+    /// suppresses the probe outright, which is the difference being made here:
+    /// some aggregators do publish a jar, and dropping it leaves a classpath
+    /// missing classes that were there.
+    pub optional: bool,
 }
 
 /// How many times a `<relocation>` or `available-at` chain is followed before
@@ -326,12 +364,24 @@ pub struct Resolved {
 const MAX_RELOCATIONS: usize = 8;
 
 /// Resolves `roots` and their transitive dependencies.
-pub fn resolve(roots: &[Coordinates]) -> Result<Vec<Resolved>, NdkError> {
+pub fn resolve(roots: &[maven::Root]) -> Result<Vec<Resolved>, NdkError> {
     let mut resolver = Resolver::default();
     for root in roots {
+        if root.role == maven::Role::Platform {
+            resolver.declared_platforms.insert(ModuleId::new(
+                &root.coordinates.group,
+                &root.coordinates.artifact,
+            ));
+        }
+        if root.role == maven::Role::Library {
+            resolver.declared_libraries.insert(ModuleId::new(
+                &root.coordinates.group,
+                &root.coordinates.artifact,
+            ));
+        }
         resolver.consider(
-            ModuleId::new(&root.group, &root.artifact),
-            Requirement::parse(&root.version),
+            ModuleId::new(&root.coordinates.group, &root.coordinates.artifact),
+            Requirement::parse(&root.coordinates.version),
             0,
             Vec::new(),
             true,
@@ -339,12 +389,34 @@ pub fn resolve(roots: &[Coordinates]) -> Result<Vec<Resolved>, NdkError> {
         )?;
     }
     resolver.walk();
+    // A platform named in `android_libs` is read during the walk, so its
+    // versions are applied afterwards and anything that moves is walked again.
+    resolver.apply_platforms()?;
+    resolver.check_capabilities()?;
     resolver.report_range_violations();
+    let unusable = std::mem::take(&mut resolver.unusable);
+    if let Some(e) = unusable.into_iter().next() {
+        return Err(e);
+    }
     Ok(resolver.results())
 }
 
 #[derive(Default)]
 struct Resolver {
+    /// Modules an `android_libs` entry marked `!platform`, and the ones it
+    /// marked `!library`. Gradle reads a platform off the declaration rather
+    /// than off the module, so a marker here outranks whatever the packaging
+    /// would otherwise suggest.
+    declared_platforms: BTreeSet<ModuleId>,
+    declared_libraries: BTreeSet<ModuleId>,
+    /// Modules whose own metadata says they cannot be put in an APK. Collected
+    /// during the walk and raised once it finishes, so a module reached by many
+    /// paths is reported once.
+    unusable: Vec<NdkError>,
+    /// The module each relocated module id is replaced by, so that something
+    /// recorded under a declaration's own name can be found under the name the
+    /// graph is keyed by.
+    relocations: HashMap<ModuleId, ModuleId>,
     /// Effective models by coordinates, so a module reached at two versions
     /// gets both POMs read and neither is re-read.
     models: HashMap<Coordinates, Model>,
@@ -361,11 +433,24 @@ struct Resolver {
     /// The newest version any `dependencyConstraint` has recommended for a
     /// module, held until something actually wants that module.
     constrained: BTreeMap<ModuleId, String>,
+    /// The versions a platform — a BOM, or a module whose variant is
+    /// `org.gradle.category=platform` — coordinates for the whole graph.
+    ///
+    /// A platform differs from a `dependencyConstraint` in that it also applies
+    /// to a module something else already put on the classpath, which is the
+    /// whole point of naming one: `kotlin-bom` is how a project says every
+    /// `org.jetbrains.kotlin` artifact is the same version. It never *adds* a
+    /// module nothing asked for.
+    platforms: BTreeMap<ModuleId, String>,
     /// The exclusions each module was last expanded under. Exclusions are
     /// path-dependent, so a path carrying exclusions the module has not seen
     /// yet re-expands it.
     expanded: HashMap<(ModuleId, String), Vec<Exclusion>>,
     pending: VecDeque<Pending>,
+    /// The classifier and extension each module was asked for by some
+    /// dependency's `thirdPartyCompatibility.artifactSelector`. A module
+    /// without metadata of its own has nothing else to say which file to take.
+    selectors: HashMap<ModuleId, (Option<String>, Option<String>)>,
     /// Hard ranges that the selected version does not satisfy. Gradle fails
     /// these; they are reported rather than fatal because a skewed patch level
     /// is routine in the AndroidX POM set.
@@ -443,6 +528,7 @@ impl Resolver {
             version: version.clone(),
             depth,
             order: self.order,
+            excluded: excluded.clone(),
             requirement: requirement.clone(),
         };
 
@@ -465,6 +551,7 @@ impl Resolver {
             }
             return Ok(());
         }
+        self.record_relocation(&module, &version);
         let first_time = match self.selected.insert(module.clone(), claim) {
             Some(displaced) => {
                 // The winner may fall outside a hard range the version it
@@ -498,6 +585,7 @@ impl Resolver {
                 version: version.clone(),
                 depth,
                 order: self.order,
+                excluded: excluded.clone(),
                 requirement: requirement.clone(),
             };
             if self
@@ -525,45 +613,291 @@ impl Resolver {
         module: ModuleId,
         requirement: &Requirement,
     ) -> Result<(ModuleId, String), NdkError> {
-        let mut module = module;
-        for _ in 0..MAX_RELOCATIONS {
-            let mut version = match requirement {
-                Requirement::Exact(version) => version.as_str().to_owned(),
-                other => {
-                    let available = self.available(&module)?;
-                    other
-                        .resolve(&available)
-                        .map(|v| v.as_str().to_owned())
-                        .ok_or_else(|| {
-                            self.fail(
-                                &coordinates_of(&module, ""),
-                                format!("no published version satisfies `{other}`"),
-                            )
-                        })?
+        let version = match requirement {
+            Requirement::Exact(version) => version.as_str().to_owned(),
+            other => {
+                let available = self.available(&module)?;
+                other
+                    .resolve(&available)
+                    .map(|v| v.as_str().to_owned())
+                    .ok_or_else(|| {
+                        self.fail(
+                            &coordinates_of(&module, ""),
+                            format!("no published version satisfies `{other}`"),
+                        )
+                    })?
+            }
+        };
+        // Neither `<relocation>` nor `available-at` moves the graph key. Each
+        // says where the artifact is published, not which module the graph
+        // should record: the module a dependency names still has to mediate
+        // against every other claim on it, and rewriting the key would let one
+        // module ship two versions. A relocation target is reached as an edge
+        // instead, so it mediates as an ordinary module of its own.
+        Ok((module, version))
+    }
+
+    /// Notes where a relocated module's artifact is published, so a dependant's
+    /// artifact selector can be recorded under the name the graph will key the
+    /// target by. Called from `consider` because a dependant records its
+    /// selector immediately after placing the module it names, which is before
+    /// `walk` reaches that module.
+    fn record_relocation(&mut self, module: &ModuleId, version: &str) -> Option<ModuleId> {
+        let relocation = self
+            .document(&coordinates_of(module, version))
+            .ok()?
+            .relocation
+            .clone()?;
+        if relocation.group_id.is_empty() {
+            return None;
+        }
+        let target = ModuleId::new(&relocation.group_id, &relocation.artifact_id);
+        self.relocations.insert(module.clone(), target.clone());
+        Some(target)
+    }
+
+    /// The module a `<relocation>` points at, with the version to ask it for.
+    fn relocation_of(
+        &mut self,
+        coordinates: &Coordinates,
+        version: &str,
+    ) -> Result<Option<(ModuleId, String)>, NdkError> {
+        let Some(relocation) = self.document(coordinates)?.relocation.clone() else {
+            return Ok(None);
+        };
+        if relocation.group_id.is_empty() {
+            return Ok(None);
+        }
+        let target = ModuleId::new(&relocation.group_id, &relocation.artifact_id);
+        if target == ModuleId::new(&coordinates.group, &coordinates.artifact) {
+            // A relocation to another version of the same coordinates names a
+            // module that no longer publishes anything under its own name.
+            // Gradle logs an error and takes only the target's dependencies;
+            // shipping the target's bytes under the old coordinates is what
+            // Gradle refuses to do, and the other half of it — an APK with the
+            // classes missing — is a crash that only a device finds. Name the
+            // newer version instead.
+            return Err(self.fail(
+                coordinates,
+                format!(
+                    "relocates to {}:{}, which is another version of itself. Name {} \
+                     directly in `android_libs` instead",
+                    coordinates.group, relocation.version, relocation.version
+                ),
+            ));
+        }
+        // A relocation that names no version keeps the one the request already
+        // resolved to.
+        let target_version = if relocation.version.is_empty() {
+            version.to_owned()
+        } else {
+            relocation.version
+        };
+        Ok(Some((target, target_version)))
+    }
+
+    /// Whether a module is a platform: a `pom`-packaged BOM in POM terms, or a
+    /// variant marked `org.gradle.category=platform` in metadata terms.
+    fn is_platform(&mut self, coordinates: &Coordinates, model: &Model) -> bool {
+        let module = ModuleId::new(&coordinates.group, &coordinates.artifact);
+        if self.declared_libraries.contains(&module) {
+            return false;
+        }
+        if self.declared_platforms.contains(&module) {
+            return true;
+        }
+        // Unmarked, so the packaging decides. Gradle would apply no
+        // `<dependencyManagement>` to a module named as an ordinary dependency,
+        // but the packaging is all there is to go on, and a `pom` module that
+        // carries nothing but management is a BOM either way. `!library` is how
+        // a caller says not to guess.
+        if model.packaging == "pom" && !model.management.is_empty() {
+            return true;
+        }
+        self.is_metadata_platform(coordinates)
+    }
+
+    /// A GMM platform, and only when nothing else the module offers is a usable
+    /// library. A module that publishes both a `platformRuntimeElements` and a
+    /// `runtimeElements` is a library that happens to also carry a platform
+    /// variant; Gradle only treats it as a platform when one is requested, and so
+    /// does the resolution here.
+    fn is_metadata_platform(&mut self, coordinates: &Coordinates) -> bool {
+        if self.platform_variant(coordinates).is_none() {
+            return false;
+        }
+        let Some(module) = self.metadata(coordinates) else {
+            return false;
+        };
+        module.select().is_err()
+    }
+
+    fn platform_variant(&mut self, coordinates: &Coordinates) -> Option<gmm::Variant> {
+        let module = self.metadata(coordinates)?;
+        module.platform_variant(gmm::target_jvm_version()).cloned()
+    }
+
+    /// Records a platform's versions, keeping the newest of each.
+    ///
+    /// A platform states them as POM `dependencyManagement` or, in metadata
+    /// terms, as the variant's `dependencyConstraints`. Both are read, because a
+    /// platform that publishes only one of them would otherwise do nothing.
+    fn collect_platform(
+        &mut self,
+        coordinates: &Coordinates,
+        management: &BTreeMap<ModuleId, Managed>,
+    ) {
+        let mut versions: BTreeMap<ModuleId, String> = management
+            .iter()
+            .filter(|(_, managed)| !managed.bom)
+            .map(|(module, managed)| (module.clone(), managed.version.clone()))
+            .collect();
+        if let Some(variant) = self.platform_variant(coordinates) {
+            for constraint in &variant.dependency_constraints {
+                if let Some(version) = constraint.version.as_ref().and_then(|c| c.requirement()) {
+                    versions
+                        .entry(ModuleId::new(&constraint.group, &constraint.module))
+                        .or_insert_with(|| version.to_owned());
                 }
-            };
-            let coordinates = coordinates_of(&module, &version);
-            // `available-at` is *not* followed here. It says where the artifact
-            // is published, not which module the graph should record: the
-            // module a dependency names still has to mediate against every
-            // other claim on it, and rewriting the key would let one module
-            // ship two versions.
-            match self.document(&coordinates)?.relocation.clone() {
-                Some(relocation) if !relocation.group_id.is_empty() => {
-                    module = ModuleId::new(&relocation.group_id, &relocation.artifact_id);
-                    // A relocation that names no version keeps the one the
-                    // request already resolved to.
-                    if !relocation.version.is_empty() {
-                        version = relocation.version;
-                    }
-                }
-                _ => return Ok((module, version)),
             }
         }
-        Err(self.fail(
-            &coordinates_of(&module, ""),
-            "its relocation chain does not terminate",
-        ))
+        for (module, version) in versions {
+            if version.is_empty() {
+                continue;
+            }
+            let entry = self.platforms.entry(module.clone()).or_insert_with(|| {
+                log::debug!("a platform coordinates {module} to {version}");
+                version.clone()
+            });
+            if MavenVersion::new(&version) > MavenVersion::new(entry) {
+                *entry = version;
+            }
+        }
+    }
+
+    /// Applies every platform's versions, and keeps going while they keep moving
+    /// the selection, since a re-selected module can reach a further platform.
+    fn apply_platforms(&mut self) -> Result<bool, NdkError> {
+        let mut moved = false;
+        while !self.platforms.is_empty() {
+            let batch = std::mem::take(&mut self.platforms);
+            for (module, version) in batch {
+                let requirement = Requirement::parse(&version);
+                // Checked before the coordinates are made concrete, so advice
+                // about a module nothing wants costs no request: a platform
+                // coordinates versions, it does not pull artifacts in.
+                let placed = self
+                    .selected
+                    .get(&module)
+                    .map(|c| (c.excluded.clone(), c.depth, c.ordering.clone()));
+                let Some((excluded, depth, placed_at)) = placed else {
+                    let entry = self
+                        .constrained
+                        .entry(module)
+                        .or_insert_with(|| version.clone());
+                    if MavenVersion::new(&version) > MavenVersion::new(entry) {
+                        *entry = version;
+                    }
+                    continue;
+                };
+                let (module, version) = self.concrete(module, &requirement)?;
+                if MavenVersion::new(&version) <= placed_at {
+                    continue;
+                }
+                self.consider(module, requirement, depth, excluded, false, false)?;
+                moved = true;
+            }
+            self.walk();
+        }
+        Ok(moved)
+    }
+
+    /// Reports the capabilities two different modules both provide, and the ones
+    /// a dependency required that the resolved variant does not have.
+    ///
+    /// A capability is a feature rather than a coordinate, so two modules
+    /// providing the same one under different names is a real conflict — the
+    /// relocated `asm` is the documented example — and Gradle fails it rather
+    /// than picking a winner, because there is nothing to pick on.
+    fn check_capabilities(&mut self) -> Result<(), NdkError> {
+        // (group, name) -> the resolved artifacts providing it, and the version
+        // each declares. Every component provides its own coordinates implicitly,
+        // and `selected` is keyed by module, so one module cannot be two
+        // providers of the same capability.
+        let mut providers: BTreeMap<(String, String), BTreeMap<String, String>> = BTreeMap::new();
+        let selection: Vec<(ModuleId, String)> = self
+            .selected
+            .iter()
+            .map(|(module, selection)| (module.clone(), selection.version.clone()))
+            .collect();
+        for (module, version) in &selection {
+            let coordinates = coordinates_of(module, version);
+            let mut declared = vec![gmm::Capability::implicit(
+                &coordinates.group,
+                &coordinates.artifact,
+                &coordinates.version,
+            )];
+            if let Some(metadata) = self.metadata(&coordinates)
+                && let Ok(variant) = metadata.select()
+            {
+                declared.extend(variant.capabilities.iter().cloned());
+            }
+            for capability in declared {
+                providers
+                    .entry((capability.group.clone(), capability.name.clone()))
+                    .or_default()
+                    .insert(coordinates.gav(), capability.version);
+            }
+        }
+
+        // Gradle registers a conflict as soon as two *selected* components provide
+        // the same capability — there is no `requestedCapabilities` test in that
+        // path — and then resolves it by version: `UpgradeCapabilityResolver`
+        // evicts every candidate but the highest when they declare different
+        // versions, and `LastCandidateCapabilityResolver` has nothing to choose
+        // between when they agree, so every candidate is rejected and the build
+        // fails. So the condition is "more than one provider", and the outcome
+        // is "fine while they disagree on a version, fatal once they agree".
+        for ((group, name), modules) in &providers {
+            if modules.len() < 2 {
+                continue;
+            }
+            let versions: BTreeSet<&String> = modules.values().collect();
+            if versions.len() > 1 {
+                log::warn!(
+                    "{}:{} is provided by {} at {} different versions ({}); the higher one                      is kept, as Gradle's `UpgradeCapabilityResolver` would",
+                    group,
+                    name,
+                    modules.len(),
+                    versions.len(),
+                    modules
+                        .iter()
+                        .map(|(gav, version)| format!("{gav} as {version}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                continue;
+            }
+            let owners: Vec<String> = modules
+                .iter()
+                .map(|(gav, version)| format!("{gav} (as {version})"))
+                .collect();
+            return Err(self.fail(
+                &Coordinates {
+                    group: group.clone(),
+                    artifact: name.clone(),
+                    version: String::new(),
+                },
+                format!(
+                    "is provided by {} resolved artifacts, all of them declaring it at {}, \
+                     so there is no version to choose between and Gradle rejects them all: {}",
+                    modules.len(),
+                    versions.iter().next().copied().cloned().unwrap_or_default(),
+                    owners.join(", ")
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Reads every queued module's dependencies until the winners stop moving.
@@ -591,6 +925,47 @@ impl Resolver {
             // two do not always agree: a module's runtime variant can name
             // dependencies the POM's compile scope does not, and can point
             // somewhere else entirely.
+            // A platform coordinates versions rather than requesting
+            // artifacts, so its entries are constraints on the whole graph and
+            // are collected instead of walked.
+            if let Ok(model) = self.model(&node.module, &node.version)
+                && self.is_platform(&coordinates, &model)
+            {
+                let management = model.management.clone();
+                let has_dependencies = !model.dependencies.is_empty();
+                self.collect_platform(&coordinates, &management);
+                // A platform asks for nothing, so there is nothing to walk. A
+                // `pom`-packaged module can still declare real dependencies —
+                // Maven calls that an aggregator — and skipping it here would
+                // drop its whole subtree.
+                if !has_dependencies {
+                    continue;
+                }
+            }
+            // A relocated module publishes no artifact, so the only thing it
+            // contributes is an edge to the module it was moved to. The target
+            // is resolved as a module in its own right, which is how Gradle
+            // hangs it off `GradlePomModuleDescriptorBuilder
+            // .addDependencyForRelocation`.
+            match self.relocation_of(&coordinates, &node.version) {
+                Ok(Some((target, target_version))) => {
+                    if let Err(e) = self.consider(
+                        target,
+                        Requirement::parse(&target_version),
+                        node.depth + 1,
+                        node.excluded.clone(),
+                        false,
+                        false,
+                    ) {
+                        log::warn!("{e}");
+                    }
+                }
+                Err(e) => {
+                    self.unusable.push(e);
+                    continue;
+                }
+                Ok(None) => {}
+            }
             let declared = match self.declarations(&coordinates) {
                 Ok(declared) => declared,
                 // A root the user named by hand is kept even with no readable
@@ -610,6 +985,9 @@ impl Resolver {
                 if declaration.optional || !declaration.scope.reaches_classpath() {
                     continue;
                 }
+                if declaration.test_artifact {
+                    continue;
+                }
                 let (spec, constraint) = match (&declaration.version, claim) {
                     (_, Claim::Constraint) => match &declaration.version {
                         Some(version) => (version.clone(), true),
@@ -627,18 +1005,40 @@ impl Resolver {
                         continue;
                     }
                 };
+                if let Some(selector) = &declaration.artifact_selector {
+                    self.selectors
+                        .entry(declaration.module.clone())
+                        .or_insert_with(|| {
+                            (selector.classifier.clone(), selector.extension.clone())
+                        });
+                }
                 let mut excluded = node.excluded.clone();
                 excluded.extend(declaration.exclusions.iter().cloned());
                 let depth = node.depth + 1;
+                let module = declaration.module.clone();
                 if let Err(e) = self.consider(
-                    declaration.module.clone(),
-                    Requirement::parse(&spec),
+                    module.clone(),
+                    Requirement::rejecting(&spec, &declaration.rejects),
                     depth,
                     excluded,
                     false,
                     constraint,
                 ) {
                     log::warn!("{e}");
+                }
+                if let Some(selector) = &declaration.artifact_selector {
+                    // Recorded under the name the graph is keyed by, which for a
+                    // relocated module is the relocation target: the dependant
+                    // wrote the selector against the old name, but the target is
+                    // the node that produces the artifact.
+                    let target = self
+                        .relocations
+                        .get(&module)
+                        .cloned()
+                        .unwrap_or_else(|| module.clone());
+                    self.selectors.entry(target).or_insert_with(|| {
+                        (selector.classifier.clone(), selector.extension.clone())
+                    });
                 }
             }
         }
@@ -655,13 +1055,28 @@ impl Resolver {
         for (module, selection) in self.selected.clone() {
             let mut coordinates = coordinates_of(&module, &selection.version);
             let mut extension = None;
-            let mut platform = false;
+            // A module marked `!platform` ships nothing even when it publishes an
+            // archive, because its versions are constraints rather than a
+            // dependency. Gradle's `withConstraintsOnly()` drops a platform's
+            // artifacts for the same reason.
+            let mut platform = self.declared_platforms.contains(&module);
             for _ in 0..MAX_RELOCATIONS {
                 let Some(metadata) = self.metadata(&coordinates) else {
                     break;
                 };
-                let Ok(selected) = metadata.select() else {
-                    break;
+                let selected = match metadata.select() {
+                    Ok(selected) => selected,
+                    Err(_) => {
+                        // Nothing in the module is a usable library. If what it
+                        // does offer is a platform, then it ships nothing at all.
+                        if metadata
+                            .platform_variant(gmm::target_jvm_version())
+                            .is_some()
+                        {
+                            platform = true;
+                        }
+                        break;
+                    }
                 };
                 // A redirect is checked before anything else, because the
                 // metadata format forbids a redirecting variant from carrying
@@ -692,6 +1107,15 @@ impl Resolver {
             if platform {
                 continue;
             }
+            // A relocated module is a pointer, not a payload. Its target is a
+            // node of its own in `selected` and contributes the artifact, so
+            // emitting one here would ship the same bytes twice.
+            if self
+                .relocation_of(&coordinates, &selection.version)
+                .is_ok_and(|relocation| relocation.is_some())
+            {
+                continue;
+            }
             // The metadata names the archive, so it also settles what this is
             // packaged as; a POM's `<packaging>` only has to be believed when
             // there is no metadata to ask.
@@ -702,13 +1126,24 @@ impl Resolver {
                     .get(&coordinates)
                     .map_or_else(|| "jar".to_owned(), |model| model.packaging.clone()),
             };
-            if packaging == "pom" {
-                continue;
-            }
+            let (classifier, selected_extension) =
+                self.selectors.get(&module).cloned().unwrap_or((None, None));
+            let extension = selected_extension.or(extension);
+            let packaging = match &extension {
+                Some(extension) => extension.clone(),
+                None => packaging,
+            };
+            // `<packaging>pom</packaging>` says the module publishes no archive
+            // of its own, but it may anyway, and Gradle takes the jar when one
+            // is there rather than treating the absence as a failure.
+            let optional = packaging == "pom";
+            let packaging = if optional { "jar" } else { &packaging }.to_owned();
             out.entry(coordinates.clone()).or_insert_with(|| Resolved {
                 coordinates,
                 packaging,
                 extension,
+                classifier,
+                optional,
             });
         }
         out.into_values().collect()
@@ -777,16 +1212,11 @@ impl Resolver {
         };
         let mut out = Vec::new();
         for dependency in &selected.dependencies {
-            if let Some(constraint) = &dependency.version
-                && !constraint.rejects.is_empty()
-            {
-                log::warn!(
-                    "{} rejects {}:{} but rejections are not enforced",
-                    coordinates.gav(),
-                    dependency.group,
-                    dependency.module
-                );
-            }
+            let rejects = dependency
+                .version
+                .as_ref()
+                .map(|c| c.rejects.clone())
+                .unwrap_or_default();
             out.push((
                 Declaration {
                     module: ModuleId::new(&dependency.group, &dependency.module),
@@ -794,7 +1224,9 @@ impl Resolver {
                         .version
                         .as_ref()
                         .and_then(|c| c.requirement().map(str::to_owned)),
+                    rejects,
                     scope: Scope::Compile,
+                    test_artifact: false,
                     optional: false,
                     exclusions: dependency
                         .excludes
@@ -804,6 +1236,10 @@ impl Resolver {
                             artifact: e.module.clone(),
                         })
                         .collect(),
+                    artifact_selector: dependency
+                        .third_party_compatibility
+                        .as_ref()
+                        .and_then(|t| t.artifact_selector.clone()),
                 },
                 Claim::Undeclared,
             ));
@@ -816,9 +1252,12 @@ impl Resolver {
                         .version
                         .as_ref()
                         .and_then(|c| c.requirement().map(str::to_owned)),
+                    rejects: Vec::new(),
                     scope: Scope::Compile,
+                    test_artifact: false,
                     optional: false,
                     exclusions: Vec::new(),
+                    artifact_selector: None,
                 },
                 // Version advice, not a dependency. A platform's constraint
                 // list names every version it coordinates, most of which the
@@ -839,13 +1278,22 @@ impl Resolver {
             return cached.clone();
         }
         // A module that publishes no `.module` is the common case on Maven
-        // Central, so a missing one is not a failure.
+        // Central, so a missing one is not a failure. It is recorded either way:
+        // leaving the negative case uncached re-probes for it on every call, and
+        // several code paths ask per module.
+        let module = self.read_metadata(coordinates);
+        self.metadata.insert(coordinates.clone(), module.clone());
+        module
+    }
+
+    fn read_metadata(&self, coordinates: &Coordinates) -> Option<gmm::Module> {
         let path = maven::fetch_artifact_inner(
             &maven::artifact_dir(coordinates),
             &coordinates.group,
             &coordinates.artifact,
             &coordinates.version,
             "module",
+            None,
             true,
         )
         .ok()
@@ -857,16 +1305,13 @@ impl Resolver {
                 return None;
             }
         };
-        let module = match serde_json::from_str::<gmm::Module>(&json) {
-            Ok(module) => module,
+        match serde_json::from_str::<gmm::Module>(&json) {
+            Ok(module) => Some(module),
             Err(e) => {
                 log::warn!("cannot parse metadata for {}: {e}", coordinates.gav());
-                return None;
+                None
             }
-        };
-        self.metadata
-            .insert(coordinates.clone(), Some(module.clone()));
-        Some(module)
+        }
     }
 
     /// Fetches and parses a POM, once.
@@ -923,21 +1368,23 @@ impl Resolver {
         };
 
         let mut model = inherit(&raw, parent.as_ref())?;
-        self.expand_imports(&mut model.management)?;
+        self.expand_imports(&mut model)?;
         Ok(model)
     }
 
     /// Folds imported BOMs into the management table. A locally declared entry
     /// wins over an imported one, so imports are applied after the parent chain
     /// and only fill gaps.
-    fn expand_imports(
-        &mut self,
-        management: &mut BTreeMap<ModuleId, Managed>,
-    ) -> Result<(), NdkError> {
-        let imports: Vec<ModuleId> = management
+    fn expand_imports(&mut self, model: &mut Model) -> Result<(), NdkError> {
+        let order = model.imports_in_order();
+        let management = &mut model.management;
+        // The order the POM declares its imports in, not the map's: two BOMs
+        // managing the same module resolve to whichever is declared first, and a
+        // `BTreeMap` made that the alphabetically first.
+        let imports: Vec<ModuleId> = order
             .iter()
-            .filter(|(_, managed)| managed.bom)
-            .map(|(module, _)| module.clone())
+            .filter(|module| management.get(module).is_some_and(|managed| managed.bom))
+            .cloned()
             .collect();
         for module in imports {
             let version = management
@@ -949,6 +1396,11 @@ impl Resolver {
                 management.entry(module).or_insert(managed);
             }
         }
+        // An import is a request for the BOM's versions, never a version for the
+        // BOM itself. Gradle's `addDependencies` skips import-scoped entries for
+        // exactly this reason; leaving one in place would pin a module the
+        // consumer also asks for directly to the BOM's own version.
+        management.retain(|_, managed| !managed.bom);
         Ok(())
     }
 
@@ -961,19 +1413,23 @@ impl Resolver {
             .join(module.group.replace('.', "/"))
             .join(&module.artifact);
         let path = dir.join("maven-metadata.xml");
-        let url = format!(
-            "{}/{}/{}/maven-metadata.xml",
-            maven::repo_base(&module.group),
-            module.group.replace('.', "/"),
-            module.artifact
-        );
+        let mut last = String::new();
         if !path.is_file() {
-            maven::download_with_curl_or_wget(&url, &path).map_err(|e| {
-                self.fail(
-                    &coordinates_of(module, ""),
-                    format!("no version list at {url}: {e}"),
-                )
-            })?;
+            for repository in maven::repo_bases(&module.group) {
+                let url = format!(
+                    "{}/{}/{}/maven-metadata.xml",
+                    repository.url.trim_end_matches('/'),
+                    module.group.replace('.', "/"),
+                    module.artifact
+                );
+                match maven::download_authenticated(&url, &path, repository) {
+                    Ok(()) => break,
+                    Err(reason) => last = format!("no version list at {url}: {reason}"),
+                }
+            }
+            if !path.is_file() {
+                return Err(self.fail(&coordinates_of(module, ""), last));
+            }
         }
         let xml = std::fs::read_to_string(&path).map_err(|e| {
             self.fail(
@@ -998,7 +1454,7 @@ impl Resolver {
         if versions.is_empty() {
             return Err(self.fail(
                 &coordinates_of(module, ""),
-                format!("{url} lists no versions"),
+                format!("{} lists no versions", path.display()),
             ));
         }
         self.available.insert(module.clone(), versions.clone());
@@ -1032,13 +1488,28 @@ fn inherit(raw: &Pom, parent: Option<&Model>) -> Result<Model, NdkError> {
         .unwrap_or_default();
     seed_properties(&mut properties, &group, &version, &raw.parent);
 
-    let mut management: BTreeMap<ModuleId, Managed> =
-        parent.map(|p| p.management.clone()).unwrap_or_default();
+    // `local > import > parent`, the order Gradle's `PomReader.resolveDependencyMgt`
+    // applies them in, so an imported BOM outranks an inherited version and the
+    // POM's own entries outrank both. The import entries stay marked so that
+    // `expand_imports` can fill them in and a platform's own coordinates are not
+    // turned into a constraint on themselves.
+    let mut management = BTreeMap::new();
+    let mut imports = Vec::new();
     for entry in managed_entries(raw) {
-        if let Some(managed) = managed_entry(entry)? {
-            management.insert(entry.module(), managed);
+        match managed_entry(entry)? {
+            Some(managed) if managed.bom => imports.push((entry.module(), managed)),
+            Some(managed) => {
+                management.insert(entry.module(), managed);
+            }
+            None => {}
         }
     }
+    if let Some(parent) = parent {
+        for (module, managed) in parent.management.clone() {
+            management.entry(module).or_insert(managed);
+        }
+    }
+    management.extend(imports);
 
     let mut dependencies: Vec<Declaration> = raw
         .dependencies
@@ -1102,6 +1573,12 @@ fn managed_entries(raw: &Pom) -> impl Iterator<Item = &Dependency> {
 }
 
 impl Dependency {
+    /// `<type>test-jar</type>` publishes a test fixture, not a library, and it
+    /// is absent from the main artifact a fetch would look for.
+    fn is_test_artifact(&self) -> bool {
+        self.kind.as_deref().map(str::trim) == Some("test-jar")
+    }
+
     fn module(&self) -> ModuleId {
         ModuleId::new(&self.group_id, &self.artifact_id)
     }
@@ -1121,6 +1598,8 @@ impl Declaration {
             module: entry.module(),
             version: entry.version.clone(),
             scope: Scope::parse(entry.scope.as_deref()),
+            test_artifact: entry.is_test_artifact(),
+            rejects: Vec::new(),
             optional: entry
                 .optional
                 .as_deref()
@@ -1134,6 +1613,7 @@ impl Declaration {
                     artifact: e.artifact_id.trim().to_owned(),
                 })
                 .collect(),
+            artifact_selector: None,
         }
     }
 
@@ -1150,10 +1630,11 @@ impl Declaration {
 
 /// Reads a `<dependencyManagement>` entry, or `None` when it pins no version.
 fn managed_entry(entry: &Dependency) -> Result<Option<Managed>, NdkError> {
-    // Maven imports only a `pom`-typed entry, so `<scope>import</scope>` alone
-    // is not an import and must not be folded in as one.
-    let bom = Scope::parse(entry.scope.as_deref()) == Scope::Import
-        && entry.kind.as_deref().map(str::trim) == Some("pom");
+    // `<scope>import</scope>` alone makes an import. Gradle's
+    // `isDependencyImportScoped` tests nothing else, and Maven's
+    // `DefaultModelBuilder` does the same, so requiring `<type>pom</type>` as
+    // well discarded a working BOM's versions and left a different resolution.
+    let bom = Scope::parse(entry.scope.as_deref()) == Scope::Import;
     let Some(version) = entry.version.clone() else {
         if bom {
             return Err(NdkError::MavenLibFailed {
@@ -1413,7 +1894,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_pom_typed_entry_is_an_import() {
+    fn import_scope_alone_makes_an_import() {
+        // Gradle's `isDependencyImportScoped` tests the scope and nothing else,
+        // and Maven's `DefaultModelBuilder` does the same. Requiring
+        // `<type>pom</type>` as well discarded a working BOM's versions and left
+        // a different resolution behind.
         let model = model_of(&pom(
             r#"<groupId>g</groupId><artifactId>a</artifactId><version>1</version>
                <dependencyManagement><dependencies>
@@ -1422,8 +1907,11 @@ mod tests {
                    <type>pom</type><scope>import</scope>
                  </dependency>
                  <dependency>
-                   <groupId>g</groupId><artifactId>not-a-bom</artifactId><version>1.0</version>
+                   <groupId>g</groupId><artifactId>other-bom</artifactId><version>1.0</version>
                    <scope>import</scope>
+                 </dependency>
+                 <dependency>
+                   <groupId>g</groupId><artifactId>pinned</artifactId><version>3.0</version>
                  </dependency>
                </dependencies></dependencyManagement>"#,
         ));
@@ -1434,14 +1922,21 @@ mod tests {
                 .unwrap()
                 .bom
         );
-        // Without `<type>pom</type>` the entry is a managed version like any
-        // other, so folding its "dependencies" in would be wrong.
+        assert!(
+            model
+                .management
+                .get(&ModuleId::new("g", "other-bom"))
+                .unwrap()
+                .bom,
+            "`<scope>import</scope>` on its own is an import"
+        );
         assert!(
             !model
                 .management
-                .get(&ModuleId::new("g", "not-a-bom"))
+                .get(&ModuleId::new("g", "pinned"))
                 .unwrap()
-                .bom
+                .bom,
+            "no scope is a plain managed version"
         );
     }
 
@@ -1828,6 +2323,18 @@ mod tests {
             ),
             (
                 "g",
+                "used",
+                "1.0",
+                pom("<groupId>g</groupId><artifactId>used</artifactId><version>1.0</version>"),
+            ),
+            (
+                "g",
+                "used",
+                "2.0",
+                pom("<groupId>g</groupId><artifactId>used</artifactId><version>2.0</version>"),
+            ),
+            (
+                "g",
                 "bom",
                 "1.0",
                 pom(
@@ -2162,6 +2669,7 @@ mod tests {
         // A platform's constraint list names every version it coordinates, most
         // of which the consumer never asked for. Following one as a dependency
         // adds Compose, test fixtures and `guava` to an APK using none of them.
+        // The shape is a real one: a BOM that also publishes a library variant.
         let mut resolver = offline_with_gmm(
             &[("g", "root", "1.0", leaf())],
             &[(
@@ -2180,6 +2688,15 @@ mod tests {
                          "dependencyConstraints": [
                            {"group":"g","module":"advised","version":{"requires":"4.0"}}
                          ]
+                       },
+                       {
+                         "name": "runtimeElements",
+                         "attributes": {
+                           "org.gradle.category": "library",
+                           "org.gradle.usage": "java-runtime",
+                           "org.gradle.libraryelements": "jar"
+                         },
+                         "files": [{"name":"x.jar","url":"x.jar","size":1,"sha1":"ab"}]
                        }
                      ]
                    }"#,
@@ -2187,6 +2704,232 @@ mod tests {
         );
         let resolved = resolve_with(&mut resolver, &[("g", "root", "1.0")]);
         assert_eq!(resolved, ["g:root:1.0"]);
+    }
+
+    #[test]
+    fn a_pom_packaged_module_still_brings_its_own_dependencies() {
+        // Maven calls that an aggregator. Treating it as a platform and stopping
+        // there would drop its whole subtree with no warning.
+        let mut resolver = offline(&[
+            (
+                "g",
+                "app",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>app</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>bundle</artifactId><version>1.0</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "g",
+                "bundle",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>bundle</artifactId><version>1.0</version>
+                       <packaging>pom</packaging>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>realdep</artifactId><version>1.0</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "g",
+                "realdep",
+                "1.0",
+                pom("<groupId>g</groupId><artifactId>realdep</artifactId><version>1.0</version>"),
+            ),
+        ]);
+        seed_roots(&mut resolver, &[("g", "app", "1.0")]);
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        let artifacts: Vec<String> = resolver
+            .results()
+            .into_iter()
+            .map(|r| r.coordinates.artifact)
+            .collect();
+        assert!(
+            artifacts.contains(&"realdep".to_owned()),
+            "an aggregator's own dependencies are still resolved: {artifacts:?}"
+        );
+    }
+
+    #[test]
+    fn a_gmm_only_platform_still_coordinates() {
+        // Some platforms publish their versions only as `dependencyConstraints`
+        // in the `.module`, with no POM management at all. Reading only the POM
+        // would leave such a platform with no effect whatsoever, and
+        // `select` rejects a platform variant by design, so it has to be found
+        // on its own terms.
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "g",
+                    "lib",
+                    "1.0",
+                    pom("<groupId>g</groupId><artifactId>lib</artifactId><version>1.0</version>"),
+                ),
+                (
+                    "g",
+                    "lib",
+                    "2.0",
+                    pom("<groupId>g</groupId><artifactId>lib</artifactId><version>2.0</version>"),
+                ),
+                (
+                    "g",
+                    "platform",
+                    "1.0",
+                    pom(
+                        "<groupId>g</groupId><artifactId>platform</artifactId><version>1.0</version><packaging>pom</packaging>",
+                    ),
+                ),
+            ],
+            &[(
+                "g",
+                "platform",
+                "1.0",
+                r#"{"formatVersion":"1.1","variants":[{"name":"platformRuntimeElements",
+                    "attributes":{"org.gradle.category":"platform","org.gradle.usage":"java-runtime"},
+                    "dependencyConstraints":[{"group":"g","module":"lib","version":{"requires":"2.0"}}]}]}"#,
+            )],
+        );
+        seed_roots(
+            &mut resolver,
+            &[("g", "lib", "1.0"), ("g", "platform", "1.0")],
+        );
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        assert_eq!(
+            resolver
+                .selected
+                .get(&ModuleId::new("g", "lib"))
+                .map(|s| s.version.clone()),
+            Some("2.0".to_owned()),
+            "a platform whose versions are only in its .module still applies"
+        );
+    }
+
+    #[test]
+    fn a_rejected_version_is_not_a_candidate() {
+        // Gradle enforces `rejects` rather than recording it: a static version is
+        // checked too, so a module published only at a rejected version fails the
+        // build naming the version. A published rejection is a statement the
+        // publisher expects to hold — it is how a known-broken version is kept
+        // out of a classpath.
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "g",
+                    "app",
+                    "1.0",
+                    pom("<groupId>g</groupId><artifactId>app</artifactId><version>1.0</version>"),
+                ),
+                (
+                    "g",
+                    "lib",
+                    "1.5",
+                    pom("<groupId>g</groupId><artifactId>lib</artifactId><version>1.5</version>"),
+                ),
+                (
+                    "g",
+                    "lib",
+                    "1.6",
+                    pom("<groupId>g</groupId><artifactId>lib</artifactId><version>1.6</version>"),
+                ),
+            ],
+            &[(
+                "g",
+                "app",
+                "1.0",
+                r#"{"formatVersion":"1.1","variants":[{"name":"runtimeElements",
+                    "attributes":{"org.gradle.category":"library","org.gradle.usage":"java-runtime"},
+                    "files":[{"name":"app-1.0.jar","url":"app-1.0.jar","size":1,"sha1":"ab"}],
+                    "dependencies":[{"group":"g","module":"lib",
+                        "version":{"requires":"[1.0,2.0)","rejects":["1.6"]}}]}]}"#,
+            )],
+        );
+        seed_available(&mut resolver, "g", "lib", &["1.4", "1.5", "1.6"]);
+        seed_roots(&mut resolver, &[("g", "app", "1.0")]);
+        resolver.walk();
+        assert_eq!(
+            resolver
+                .selected
+                .get(&ModuleId::new("g", "lib"))
+                .map(|s| s.version.clone()),
+            Some("1.5".to_owned()),
+            "1.6 is rejected, so the next newest is chosen"
+        );
+    }
+
+    #[test]
+    fn a_static_version_that_is_rejected_is_not_selected() {
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "g",
+                    "app",
+                    "1.0",
+                    pom("<groupId>g</groupId><artifactId>app</artifactId><version>1.0</version>"),
+                ),
+                (
+                    "g",
+                    "lib",
+                    "1.6",
+                    pom("<groupId>g</groupId><artifactId>lib</artifactId><version>1.6</version>"),
+                ),
+            ],
+            &[(
+                "g",
+                "app",
+                "1.0",
+                r#"{"formatVersion":"1.1","variants":[{"name":"runtimeElements",
+                    "attributes":{"org.gradle.category":"library","org.gradle.usage":"java-runtime"},
+                    "files":[{"name":"app-1.0.jar","url":"app-1.0.jar","size":1,"sha1":"ab"}],
+                    "dependencies":[{"group":"g","module":"lib",
+                        "version":{"requires":"1.6","rejects":["1.6"]}}]}]}"#,
+            )],
+        );
+        seed_roots(&mut resolver, &[("g", "app", "1.0")]);
+        resolver.walk();
+        assert!(
+            !resolver.selected.contains_key(&ModuleId::new("g", "lib")),
+            "a version that is both required and rejected is not selected"
+        );
+    }
+
+    #[test]
+    fn a_module_that_publishes_only_a_platform_ships_nothing() {
+        // `platform()` names a module that coordinates versions and carries no
+        // artifact, which is what a BOM is. There is nothing to put in an APK.
+        let mut resolver = offline_with_gmm(
+            &[("g", "bom", "1.0", leaf())],
+            &[(
+                "g",
+                "bom",
+                "1.0",
+                r#"{
+                     "formatVersion": "1.1",
+                     "variants": [
+                       {
+                         "name": "platformRuntimeElements",
+                         "attributes": {
+                           "org.gradle.category": "platform",
+                           "org.gradle.usage": "java-runtime"
+                         },
+                         "dependencyConstraints": [
+                           {"group":"g","module":"advised","version":{"requires":"4.0"}}
+                         ]
+                       }
+                     ]
+                   }"#,
+            )],
+        );
+        let resolved = resolve_with(&mut resolver, &[("g", "bom", "1.0")]);
+        assert!(
+            resolved.is_empty(),
+            "a platform contributes constraints, not an artifact: {resolved:?}"
+        );
     }
 
     #[test]
@@ -2466,6 +3209,392 @@ mod tests {
             "{:?}",
             resolver.range_violations
         );
+    }
+
+    #[test]
+    fn a_platform_moves_a_version_already_on_the_classpath() {
+        // The Kotlin case: `stdlib-jdk7:1.6.21` carries classes that
+        // `stdlib:1.8.22` also carries, so d8 refuses the pair. Newest-wins
+        // cannot reconcile two different modules, and only the platform can,
+        // because it is the one artifact that speaks for the whole family.
+        let mut resolver = offline(&[
+            (
+                "g",
+                "a",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>a</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-stdlib-jdk7</artifactId><version>1.6.21</version></dependency>
+                         <dependency><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-stdlib</artifactId><version>1.8.22</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "org.jetbrains.kotlin",
+                "kotlin-bom",
+                "1.8.22",
+                pom(
+                    r#"<groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-bom</artifactId><version>1.8.22</version>
+                       <packaging>pom</packaging>
+                       <dependencyManagement><dependencies>
+                         <dependency><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-stdlib-jdk7</artifactId><version>1.8.22</version></dependency>
+                         <dependency><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-stdlib-jdk8</artifactId><version>1.8.22</version></dependency>
+                       </dependencies></dependencyManagement>"#,
+                ),
+            ),
+        ]);
+        seed_roots(
+            &mut resolver,
+            &[
+                ("g", "a", "1.0"),
+                ("org.jetbrains.kotlin", "kotlin-bom", "1.8.22"),
+            ],
+        );
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        let selected = |artifact: &str| {
+            resolver
+                .selected
+                .get(&ModuleId::new("org.jetbrains.kotlin", artifact))
+                .map(|s| s.version.clone())
+        };
+        assert_eq!(selected("kotlin-stdlib-jdk7").as_deref(), Some("1.8.22"));
+        assert_eq!(selected("kotlin-stdlib"), Some("1.8.22".to_owned()));
+    }
+
+    #[test]
+    fn a_platform_does_not_pull_in_a_module_nothing_asked_for() {
+        // A BOM coordinates every version it lists, most of which the app never
+        // reaches. Adding those would put a jar in the APK that nothing uses.
+        let mut resolver = offline(&[
+            (
+                "g",
+                "a",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>a</artifactId><version>1.0</version>
+                       <dependencies>
+                         <dependency><groupId>g</groupId><artifactId>used</artifactId><version>1.0</version></dependency>
+                       </dependencies>"#,
+                ),
+            ),
+            (
+                "g",
+                "used",
+                "1.0",
+                pom("<groupId>g</groupId><artifactId>used</artifactId><version>1.0</version>"),
+            ),
+            (
+                "g",
+                "used",
+                "2.0",
+                pom("<groupId>g</groupId><artifactId>used</artifactId><version>2.0</version>"),
+            ),
+            (
+                "g",
+                "bom",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>bom</artifactId><version>1.0</version>
+                       <packaging>pom</packaging>
+                       <dependencyManagement><dependencies>
+                         <dependency><groupId>g</groupId><artifactId>used</artifactId><version>2.0</version></dependency>
+                         <dependency><groupId>g</groupId><artifactId>unwanted</artifactId><version>3.0</version></dependency>
+                       </dependencies></dependencyManagement>"#,
+                ),
+            ),
+        ]);
+        seed_available(&mut resolver, "g", "unwanted", &["3.0"]);
+        seed_roots(&mut resolver, &[("g", "a", "1.0"), ("g", "bom", "1.0")]);
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        assert_eq!(
+            resolver
+                .selected
+                .get(&ModuleId::new("g", "used"))
+                .map(|s| s.version.clone()),
+            Some("2.0".to_owned()),
+            "the platform moves a module that is wanted"
+        );
+        assert!(
+            !resolver
+                .selected
+                .contains_key(&ModuleId::new("g", "unwanted")),
+            "the platform advises, it does not add"
+        );
+    }
+    /// Two modules, where the first declares a capability the second provides
+    /// implicitly, and both end up claiming the same capability version.
+    fn capability_pair(asm_version: &str, ow2_version: &str) -> Resolver {
+        let provides = r#"{"formatVersion":"1.1","variants":[{"name":"runtimeElements",
+            "attributes":{"org.gradle.category":"library","org.gradle.usage":"java-runtime"},
+            "capabilities":[{"group":"org.ow2.asm","name":"asm","version":"9.7"}]}]}"#;
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "asm",
+                    "asm",
+                    asm_version,
+                    pom(
+                        "<groupId>asm</groupId><artifactId>asm</artifactId><version>3.3.1</version>",
+                    ),
+                ),
+                (
+                    "org.ow2.asm",
+                    "asm",
+                    ow2_version,
+                    pom(
+                        "<groupId>org.ow2.asm</groupId><artifactId>asm</artifactId><version>9.7</version>",
+                    ),
+                ),
+            ],
+            &[("asm", "asm", asm_version, provides)],
+        );
+        seed_roots(
+            &mut resolver,
+            &[
+                ("asm", "asm", asm_version),
+                ("org.ow2.asm", "asm", ow2_version),
+            ],
+        );
+        resolver.walk();
+        resolver
+    }
+
+    #[test]
+    fn two_providers_agreeing_on_a_capability_version_are_a_conflict() {
+        // Gradle's `DependencyGraphBuilder.registerCapabilities` registers a
+        // conflict as soon as two selected components provide the same
+        // capability, and `LastCandidateCapabilityResolver` has nothing to choose
+        // between when they declare one version, so every candidate is rejected
+        // and the build fails. The relocated `asm` is the documented case.
+        let mut resolver = capability_pair("3.3.1", "9.7");
+        let error = resolver
+            .check_capabilities()
+            .expect_err("two providers of one capability version");
+        assert!(format!("{error}").contains("org.ow2.asm:asm"), "{error}");
+    }
+
+    #[test]
+    fn two_providers_disagreeing_on_a_capability_version_resolve_to_the_higher() {
+        // `UpgradeCapabilityResolver` sorts the declared capability versions and
+        // evicts every candidate but the highest, so a version disagreement is
+        // resolved rather than reported.
+        let mut resolver = capability_pair("3.3.1", "9.8");
+        resolver
+            .check_capabilities()
+            .expect("a higher capability version wins");
+    }
+
+    #[test]
+    fn one_provider_of_a_capability_is_never_a_conflict() {
+        let mut resolver = offline_with_gmm(
+            &[(
+                "com.google.guava",
+                "guava",
+                "33.0.0-android",
+                pom(
+                    "<groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>33.0.0-android</version>",
+                ),
+            )],
+            &[(
+                "com.google.guava",
+                "guava",
+                "33.0.0-android",
+                r#"{"formatVersion":"1.1","variants":[{"name":"runtimeElements",
+                    "attributes":{"org.gradle.category":"library","org.gradle.usage":"java-runtime"},
+                    "capabilities":[{"group":"com.google.collections","name":"google-collections","version":"1.0"}]}]}"#,
+            )],
+        );
+        seed_roots(
+            &mut resolver,
+            &[("com.google.guava", "guava", "33.0.0-android")],
+        );
+        resolver.walk();
+        resolver
+            .check_capabilities()
+            .expect("guava's legacy shim capability on its own is fine");
+    }
+
+    /// `old:1.0` moved to `new:1.0`; `old:2.0` stayed where it is.
+    fn relocation_fixture() -> [(&'static str, &'static str, &'static str, String); 3] {
+        [
+            (
+                "g",
+                "new",
+                "1.0",
+                pom("<groupId>g</groupId><artifactId>new</artifactId><version>1.0</version>"),
+            ),
+            (
+                "g",
+                "old",
+                "1.0",
+                pom(
+                    r#"<groupId>g</groupId><artifactId>old</artifactId><version>1.0</version>
+                       <relocation><groupId>g</groupId><artifactId>new</artifactId><version>1.0</version></relocation>"#,
+                ),
+            ),
+            (
+                "g",
+                "old",
+                "2.0",
+                pom("<groupId>g</groupId><artifactId>old</artifactId><version>2.0</version>"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_relocated_module_ships_its_target_and_nothing_of_itself() {
+        // Gradle marks a relocated module `setRelocated(true)`, and
+        // `RealisedMavenModuleResolveMetadata.getArtifactsForConfiguration`
+        // returns no artifacts for it, so the bytes come from the target alone.
+        let mut resolver = offline(&relocation_fixture());
+        seed_roots(&mut resolver, &[("g", "old", "1.0")]);
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        let artifacts: Vec<String> = resolver
+            .results()
+            .into_iter()
+            .map(|r| r.coordinates.gav())
+            .collect();
+        assert_eq!(artifacts, vec!["g:new:1.0".to_owned()]);
+    }
+
+    #[test]
+    fn a_module_relocated_at_one_version_and_not_another_ships_one_artifact() {
+        // Re-keying the graph onto the relocation target put the relocated claim
+        // under `g:new` and the un-relocated one under `g:old`, so mediation
+        // never compared the two and both artifacts shipped. Gradle keys every
+        // claim on the module a dependency names, so `2.0` wins outright and
+        // `new` is never reached at all.
+        let mut resolver = offline(&relocation_fixture());
+        seed_roots(&mut resolver, &[("g", "old", "1.0"), ("g", "old", "2.0")]);
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        let artifacts: Vec<String> = resolver
+            .results()
+            .into_iter()
+            .map(|r| r.coordinates.gav())
+            .collect();
+        assert_eq!(artifacts, vec!["g:old:2.0".to_owned()]);
+    }
+
+    #[test]
+    fn a_relocation_to_another_version_of_itself_is_refused() {
+        // The other coordinates name a module that publishes nothing under this
+        // name. Gradle logs an error, takes the target's dependencies and ships
+        // no artifact; the other half of that is an APK whose classes are
+        // missing, which only a device finds, so the build stops here instead.
+        let mut resolver = offline(&[(
+            "g",
+            "old",
+            "1.0",
+            pom(
+                r#"<groupId>g</groupId><artifactId>old</artifactId><version>1.0</version>
+                   <relocation><groupId>g</groupId><artifactId>old</artifactId><version>2.0</version></relocation>"#,
+            ),
+        )]);
+        seed_roots(&mut resolver, &[("g", "old", "1.0")]);
+        resolver.walk();
+        let unusable = std::mem::take(&mut resolver.unusable);
+        let error = unusable
+            .into_iter()
+            .next()
+            .expect("the relocation is refused");
+        assert!(format!("{error}").contains("Name 2.0 directly"), "{error}");
+    }
+
+    #[test]
+    fn an_artifact_selector_survives_a_relocation() {
+        // The selector is recorded under the name the dependant wrote, but the
+        // graph is keyed by the relocation target, so the two have to be joined.
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "g",
+                    "app",
+                    "1.0",
+                    pom("<groupId>g</groupId><artifactId>app</artifactId><version>1.0</version>"),
+                ),
+                (
+                    "g",
+                    "new",
+                    "1.0",
+                    pom("<groupId>g</groupId><artifactId>new</artifactId><version>1.0</version>"),
+                ),
+                (
+                    "g",
+                    "old",
+                    "1.0",
+                    pom(
+                        r#"<groupId>g</groupId><artifactId>old</artifactId><version>1.0</version>
+                           <relocation><groupId>g</groupId><artifactId>new</artifactId><version>1.0</version></relocation>"#,
+                    ),
+                ),
+            ],
+            &[(
+                "g",
+                "app",
+                "1.0",
+                r#"{"formatVersion":"1.1","variants":[{"name":"runtimeElements",
+                    "attributes":{"org.gradle.category":"library","org.gradle.usage":"java-runtime"},
+                    "dependencies":[{"group":"g","module":"old","version":{"requires":"1.0"},
+                        "thirdPartyCompatibility":{"artifactSelector":{
+                            "extension":"jar","classifier":"linux-x86_64"}}}]}]}"#,
+            )],
+        );
+        seed_roots(&mut resolver, &[("g", "app", "1.0")]);
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        let relocated = resolver
+            .results()
+            .into_iter()
+            .find(|r| r.coordinates.artifact == "new")
+            .expect("the relocated module is what is fetched");
+        assert_eq!(relocated.classifier.as_deref(), Some("linux-x86_64"));
+    }
+
+    #[test]
+    fn an_artifact_selector_reaches_the_artifact_to_fetch() {
+        let mut resolver = offline_with_gmm(
+            &[
+                (
+                    "g",
+                    "a",
+                    "1.0",
+                    pom("<groupId>g</groupId><artifactId>a</artifactId><version>1.0</version>"),
+                ),
+                (
+                    "g",
+                    "toolchain",
+                    "1.0",
+                    pom(
+                        "<groupId>g</groupId><artifactId>toolchain</artifactId><version>1.0</version>",
+                    ),
+                ),
+            ],
+            &[(
+                "g",
+                "a",
+                "1.0",
+                r#"{"formatVersion":"1.1","variants":[{"name":"runtimeElements",
+                    "attributes":{"org.gradle.category":"library","org.gradle.usage":"java-runtime"},
+                    "dependencies":[{"group":"g","module":"toolchain","version":{"requires":"1.0"},
+                        "thirdPartyCompatibility":{"artifactSelector":{
+                            "extension":"jar","classifier":"linux-x86_64"}}}]}]}"#,
+            )],
+        );
+        seed_roots(&mut resolver, &[("g", "a", "1.0")]);
+        resolver.walk();
+        resolver.apply_platforms().expect("platforms apply");
+        let toolchain = resolver
+            .results()
+            .into_iter()
+            .find(|r| r.coordinates.artifact == "toolchain")
+            .expect("the selected dependency is an artifact to fetch");
+        assert_eq!(toolchain.classifier.as_deref(), Some("linux-x86_64"));
+        assert_eq!(toolchain.extension.as_deref(), Some("jar"));
     }
 
     #[test]

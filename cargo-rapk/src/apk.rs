@@ -215,9 +215,44 @@ impl<'a> ApkBuilder<'a> {
 
     fn android_libs(&self) -> Result<Vec<String>, Error> {
         let mut libs = self.manifest.android_libs.clone();
+        if let Some(repositories) = &self.manifest.maven_repositories {
+            rndk::maven::set_repositories(repositories.iter().map(|r| r.resolved()).collect());
+        }
         libs.extend(collect_android_contributions(self.cmd.manifest())?.android_libs);
         libs.dedup();
         Ok(libs)
+    }
+
+    /// Reports a library that needs a newer API level than the app declares.
+    ///
+    /// Nothing enforces this at build time, so the app installs on an older
+    /// device and then fails on a class the library assumed would be there.
+    fn check_library_min_sdk(&self, libs: &[rndk::maven::ResolvedLib]) -> Result<(), Error> {
+        let Some(app_min) = self.manifest.android_manifest.sdk.min_sdk_version else {
+            return Ok(());
+        };
+        let mut offending: Vec<(u32, String)> = libs
+            .iter()
+            .filter_map(|lib| Some((lib.min_sdk_version?, lib.coordinates.gav())))
+            .filter(|(required, _)| *required > app_min)
+            .collect();
+        offending.sort_unstable();
+        offending.dedup();
+        if offending.is_empty() {
+            return Ok(());
+        }
+        let highest = offending
+            .iter()
+            .map(|(required, _)| *required)
+            .max()
+            .unwrap();
+        let names: Vec<String> = offending.iter().map(|(_, gav)| gav.clone()).collect();
+        Err(NdkError::LibraryMinSdkTooHigh {
+            required: highest,
+            app: app_min,
+            libraries: names.join(", "),
+        }
+        .into())
     }
 
     /// Resolves every external tool and input the build needs, without
@@ -346,6 +381,7 @@ impl<'a> ApkBuilder<'a> {
             let libs = self.android_libs()?;
             if !libs.is_empty() {
                 let resolved = rndk::maven::resolve_libs(&libs)?;
+                self.check_library_min_sdk(&resolved)?;
                 let with_res = resolved
                     .iter()
                     .filter(|lib| lib.resources.is_some())
@@ -462,6 +498,7 @@ impl<'a> ApkBuilder<'a> {
                 actions: vec!["android.intent.action.MAIN".to_string()],
                 categories: vec!["android.intent.category.LAUNCHER".to_string()],
                 data: vec![],
+                ..Default::default()
             });
         }
 
@@ -522,7 +559,9 @@ impl<'a> ApkBuilder<'a> {
         let mut library_resources = Vec::new();
         let mut library_manifests = Vec::new();
         let mut r_libraries = Vec::new();
-        for resolved in rndk::maven::resolve_libs(&android_libs)? {
+        let resolved_libs = rndk::maven::resolve_libs(&android_libs)?;
+        self.check_library_min_sdk(&resolved_libs)?;
+        for resolved in &resolved_libs {
             lib_jars.extend(resolved.jars.iter().cloned());
             if let Some(res) = &resolved.resources {
                 library_resources.push(res.clone());
@@ -538,7 +577,7 @@ impl<'a> ApkBuilder<'a> {
             }
             // Manifest merging is independent of the above, so it cannot be
             // gated on the manifest having survived the contributions filter.
-            library_manifests.extend(resolved.manifest);
+            library_manifests.extend(resolved.manifest.clone());
         }
         lib_jars.sort();
         lib_jars.dedup();

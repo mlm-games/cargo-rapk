@@ -285,6 +285,30 @@ pub(crate) fn compile_java_sources(
     class_files.sort();
     class_files.dedup();
 
+    // Checked before d8 runs, so a conflict is a diagnosis naming the two
+    // artifacts rather than `d8`'s own report, which quotes the whole classpath
+    // and leaves the reader to find the pair inside it. Everything handed to d8
+    // has to be here: a Kotlin app that also lists `kotlin-stdlib` in
+    // `android_libs` gets the toolchain's own stdlib added to the dex, and that
+    // pair is a duplicate the check would otherwise miss.
+    let mut dexed: Vec<PathBuf> = jar_files.clone();
+    dexed.extend(kotlin_stdlib_jar.iter().cloned());
+    let duplicates = rndk::maven::duplicate_classes(&dexed).unwrap_or_default();
+    if !duplicates.is_empty() {
+        let mut report = String::new();
+        for (class, owners) in duplicates.iter().take(20) {
+            report.push_str(&format!("\n  {class}\n    {}", owners.join("\n    ")));
+        }
+        if duplicates.len() > 20 {
+            report.push_str(&format!("\n  ... and {} more", duplicates.len() - 20));
+        }
+        return Err(NdkError::DuplicateClasses {
+            count: duplicates.len(),
+            classes: report,
+        }
+        .into());
+    }
+
     let mut d8 = ndk.d8()?;
     d8.arg("--lib")
         .arg(&android_jar)

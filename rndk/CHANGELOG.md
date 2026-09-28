@@ -1,4 +1,47 @@
-# 0.25.0 (2026-09-27)
+# 0.25.0 (2026-09-28)
+- Add `maven::Role` and `maven::parse_entry`, letting an `android_libs` entry carry `!platform` or `!library`, and add `declared_platforms` and `declared_libraries` to the resolver. Gradle takes a platform off the declaration and applies no `<dependencyManagement>` to a module named as an ordinary dependency; `<packaging>` cannot say which was meant, so the entry can.
+- **Fix:** Key a relocated module by the coordinates a dependency names, hang the target off it as an edge, and ship nothing for the original. `GradlePomModuleDescriptorBuilder.addDependencyForRelocation` adds the target as a compile-scoped dependency and `setRelocated(true)` costs the module its own artifacts, so the graph mediates on the original and the target resolves as a module in its own right. Re-keying onto the target meant a module relocated at one version and not another never had its two claims compared.
+- **Fix:** Refuse a relocation to another version of the same coordinates, which names a module that publishes nothing under its own name, rather than shipping the target's bytes under the old name or silently shipping nothing.
+- **Fix:** Take a `pom`-packaged module's own jar when the repository publishes one, and treat its absence as not-published rather than a failure, as `metadata.optionalArtifact` models it. The AAR-then-jar fallback reported a missing jar as an error, which failed every closure holding a BOM.
+- **Fix:** Hand a repository's token and password to `curl` through `--config -`, on standard input, rather than as `-H` and `-u` arguments that any process on the machine can read from `/proc/<pid>/cmdline`.
+- **Fix:** Remove the variant-selection "matches the most attributes" step and put the extra-attribute steps in Gradle's order, preferring a variant that declares an extra attribute before one that lacks it. Verified against `MultipleCandidateMatcher.disambiguateCompatibleCandidates`.
+- **Fix:** Reject `org.gradle.usage=java-api` on a runtime classpath, and accept a `-jars`/`-classes`/`-resources` usage as its bare form. Verified against `JavaEcosystemSupport.UsageCompatibilityRules` and `UsageCompatibilityHandler`.
+- **Fix:** Read an attribute value that is a boolean or a number, adding `gmm::Value`. Verified against the specification and against `androidx.annotation:annotation:1.3.0`.
+- **Fix:** Settle `org.gradle.jvm.version` in Gradle's disambiguation precedence, ahead of `org.jetbrains.kotlin.platform.type`.
+- **Fix:** Enforce a GMM `rejects` list, adding `Requirement::Rejecting` and `Requirement::rejecting`. Verified against `DefaultResolvedVersionConstraint.accepts` and `RepositoryChainDependencyToComponentIdResolver`.
+- **Fix:** Treat `<scope>import</scope>` alone as an import, merge `dependencyManagement` as `local > import > parent`, and resolve two imports of one module to the first declared. Verified against `PomReader.resolveDependencyMgt` and `GradlePomModuleDescriptorParser.parseImportedDependencyMgts`.
+- **Fix:** Exclude a platform's import entries from the versions it coordinates, as `GradlePomModuleDescriptorParser.addDependencies` does.
+- **Fix:** Report a capability conflict only when two resolved artifacts provide the same one and agree on a version, and resolve a version disagreement to the highest. Verified against `UpgradeCapabilityResolver` and `LastCandidateCapabilityResolver`.
+- Add `maven::unserved`, for a group no configured repository serves.
+- Skip a `<type>test-jar</type>` dependency, which is a test fixture rather than a library and is absent from the artifact a fetch would look for.
+- Do not fetch a `.sha1` for an artifact a cached file already came from, so a repository publishing no sidecar costs one download rather than one per build.
+- **Fix:** Read `java.specification.version` from `java -XshowSettings:properties`, which prints spaces around the `=`. Read wrong, `Ndk::java_version` was always `None` and `gmm::target_jvm_version` fell back to Java 8.
+- **Fix:** Exclude a root `module-info.class` and a `META-INF/versions/` overlay from `duplicate_classes`; neither is a class `d8` dexes.
+- **Fix:** Give every `Repository` field but `url` a serde default, so a minimal entry does not fail the read.
+- **Fix:** Leave an unterminated `${` in a repository field as written, rather than emitting the preceding text twice.
+- **Fix:** Return no repository for a group none is configured to serve, instead of every one of them, and add `maven::unserved` for the message.
+- **Fix:** Expand `${NAME}` in the environment-variable repository forms, and read them as either a bare array or a `[[repository]]` table.
+- **Fix:** Reuse a cached file from a repository that publishes no `.sha1` rather than re-downloading it.
+- **Fix:** Read `org.gradle.jvm.version` written as `1.8`, which parses as nothing and so looked like no requirement at all.
+- **Fix:** Name the artifact directory in a `duplicate_classes` report, not the version directory.
+- **Fix:** Resolve a `pom`-packaged module's own dependencies, which treating it purely as a platform dropped.
+- **Fix:** Apply a platform whose versions are only `dependencyConstraints` in its `.module`, and treat a module as a platform only when nothing else it offers is a usable library.
+- **Fix:** Key a recorded `artifactSelector` by the relocation target, so a relocated module keeps its classifier. The target is now a node of its own, reached as an edge from the module a dependency names, so the selector is recorded under the name the graph actually keys the artifact by.
+- **Fix:** Apply a `requestedCapabilities` requirement, which was parsed and never checked.
+- **Fix:** Cache the negative result of a metadata lookup, so a module publishing no `.module` is not re-probed for on every call.
+- **Fix:** Find a platform variant directly, since `select` requests `org.gradle.category=library` and rejects one by design.
+
+- Add `maven::Repository` and `maven::set_repositories`, and search every repository in order rather than deriving one from the group prefix. Add `maven::repo_bases` and `maven::artifact_url_classified`, and a `classifier` on `Resolved`, `ResolvedLib` and the fetch, for an artifact published under one.
+- Add `maven::duplicate_classes`, reporting each class two archives both define and which archives those are. `META-INF/` is excluded, being JPMS descriptors rather than classes to dex.
+- Read a library's `uses-sdk` `minSdkVersion` as `ResolvedLib::min_sdk_version`.
+- Add `gmm::Capability` and `gmm::ArtifactSelector`, read from a variant's `capabilities` and a dependency's `requestedCapabilities` and `thirdPartyCompatibility`. Reject two resolved modules providing one capability.
+- Add `gmm::Module::select_for_jvm` and honour `org.gradle.jvm.version` when choosing a variant; `gmm::target_jvm_version` reports the JDK the build will use, overridable with `CARGO_RAPK_JVM_VERSION`.
+- Verify a download against a `.sha1` sidecar when the repository publishes one and report it when it does not, rather than failing. A sidecar that disagrees still fails.
+- **Breaking:** `manifest::parse_library_manifest` returns a `LibraryManifest`, which carries the `AndroidManifest` and an `unmodelled` list of what a library declared and could not be carried over. Previously anything dropped was invisible.
+- **Breaking:** Add `Permission::protection_level`, `Application::app_component_factory`, `Application::uses_library` and the `UsesLibrary` type, `Activity::theme`, `Activity::{exclude_from_recents, fits_system_windows, state_not_needed}`, `Service::visible_to_instant_apps`, `Provider::direct_boot_aware`, `IntentFilter::priority`, and `IntentFilterData::{path_suffix, path_advanced_pattern}`.
+- **Breaking:** `AndroidManifest::merge_library` takes the library's `AndroidManifest` as before, but a library's `appComponentFactory` is now carried when the app has none of its own.
+- Add `Ndk::java_version`, reading `java.specification.version` from the JDK.
+- Add `NdkError::{DuplicateClasses, LibraryMinSdkTooHigh}`.
 
 - **Breaking:** Add transitive Maven resolution for `android_libs`, following POMs and Gradle Module Metadata, with newest-wins mediation and a warning when the selected version falls outside a hard range. Add the `pom`, `gmm`, `range` and `version` modules, and `maven::{ensure_lib, Coordinates, ResolvedLib}`.
 - **Breaking:** Add `AndroidManifest::{permission, grant_uri_permission}`, `tools_node` on `Activity`, `Service`, `Receiver` and `Provider`, and `enabled` on `Activity` and `Service`. `Receiver::enabled` and `Provider::enabled` widen from `Option<bool>` to `Option<Enabled>`. Downstream struct literals of these public types need updating.

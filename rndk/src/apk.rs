@@ -5,7 +5,7 @@ use crate::libs::LibResolver;
 use crate::manifest::AndroidManifest;
 use crate::ndk::{Key, Ndk};
 use crate::target::Target;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -158,10 +158,20 @@ impl ApkConfig {
     /// Folds every library manifest into the app's, then writes it.
     fn write_merged_manifest(&self) -> Result<(), NdkError> {
         let mut manifest = self.manifest.clone();
+        let mut unmodelled: BTreeSet<String> = BTreeSet::new();
         for library in &self.library_manifests {
             let library = crate::manifest::parse_library_manifest(library)
                 .map_err(NdkError::LibraryManifestInvalid)?;
-            manifest.merge_library(&library, &self.manifest.package);
+            manifest.merge_library(&library.manifest, &self.manifest.package);
+            unmodelled.extend(library.unmodelled);
+        }
+        if !unmodelled.is_empty() {
+            log::warn!(
+                "{} declaration(s) in the merged library manifests are not modelled and \
+                 were not carried over; the app may be missing them at runtime:\n  {}",
+                unmodelled.len(),
+                unmodelled.into_iter().collect::<Vec<_>>().join("\n  ")
+            );
         }
         manifest.write_to(&self.build_dir)
     }
@@ -211,9 +221,9 @@ impl ApkConfig {
         })
     }
 
-    /// The compiled `.flat` overlays from the last [`Self::compile_resources`]
-    /// call, in the same order, so a later step can generate `R` classes from
-    /// the identical table.
+    /// The compiled `.flat` overlays from the last resource compilation, in the
+    /// same order, so a later step can generate `R` classes from the identical
+    /// table.
     pub fn compiled_overlays(&self) -> Result<Vec<PathBuf>, NdkError> {
         let compiled = self.build_dir.join("compiled_res");
         if !compiled.is_dir() {
