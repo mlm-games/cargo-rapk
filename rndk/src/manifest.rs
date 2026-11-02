@@ -816,6 +816,11 @@ pub struct Application {
     )]
     pub uses_cleartext_traffic: Option<bool>,
     #[serde(
+        rename(serialize = "@android:enableOnBackInvokedCallback"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_on_back_invoked_callback: Option<bool>,
+    #[serde(
         rename(serialize = "@android:requestLegacyExternalStorage"),
         skip_serializing_if = "Option::is_none"
     )]
@@ -871,6 +876,7 @@ impl Default for Application {
             label: String::new(),
             extract_native_libs: None,
             uses_cleartext_traffic: None,
+            enable_on_back_invoked_callback: None,
             request_legacy_external_storage: None,
             allow_native_heap_pointer_tagging: None,
             install_location: None,
@@ -1646,6 +1652,14 @@ mod tests {
             r#"<meta-data android:name="android.app.lib_name" android:value="example"/>"#
         ));
         assert!(!xml.contains("android:resource"));
+    }
+
+    #[test]
+    fn enable_on_back_invoked_callback_serializes() {
+        let application: Application =
+            toml::from_str("enable_on_back_invoked_callback = true").unwrap();
+        let xml = quick_xml::se::to_string(&application).unwrap();
+        assert!(xml.contains(r#"android:enableOnBackInvokedCallback="true""#));
     }
 }
 

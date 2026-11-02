@@ -364,6 +364,12 @@ extract_native_libs = true
 # See https://developer.android.com/guide/topics/manifest/application-element#usesCleartextTraffic
 uses_cleartext_traffic = true
 
+# See https://developer.android.com/guide/topics/manifest/application-element#enableOnBackInvokedCallback
+#
+# Opt in to the platform back APIs so the Activity can register
+# OnBackInvokedCallback (Android 13) and OnBackAnimationCallback (Android 14).
+enable_on_back_invoked_callback = true
+
 # See https://developer.android.com/guide/topics/manifest/application-element#requestLegacyExternalStorage
 request_legacy_external_storage = true
 
