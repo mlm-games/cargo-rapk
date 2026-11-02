@@ -534,11 +534,11 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
         reason,
     };
     let root_pom = fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "pom")
-        .map_err(&fail)?
+        .map_err(fail)?
         .ok_or_else(|| fail("embeddable POM unpublished".into()))?;
     let root_xml = std::fs::read_to_string(&root_pom).map_err(|e| fail(e.to_string()))?;
     fetch_artifact(&dir, KOTLIN_GROUP, EMBEDDABLE_ARTIFACT, &version, "jar")
-        .map_err(&fail)?
+        .map_err(fail)?
         .ok_or_else(|| fail("embeddable jar unpublished".into()))?;
     let mut seen = std::collections::HashSet::from([(
         KOTLIN_GROUP.to_string(),
@@ -550,7 +550,7 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
         let key = (dep.group.clone(), dep.artifact.clone(), dep.version.clone());
         if seen.insert(key) {
             fetch_artifact(&dir, &dep.group, &dep.artifact, &dep.version, "jar")
-                .map_err(&fail)?
+                .map_err(fail)?
                 .ok_or_else(|| fail(format!("{} unpublished", dep.artifact)))?;
         }
         if !dep.no_descend {
@@ -579,7 +579,7 @@ pub fn fetch_maven(version: &str) -> Result<MavenToolchain, NdkError> {
             let key = (t.group.clone(), t.artifact.clone(), t.version.clone());
             if seen.insert(key)
                 && fetch_artifact_inner(&dir, &t.group, &t.artifact, &t.version, "jar", None, true)
-                    .map_err(&fail)?
+                    .map_err(fail)?
                     .is_none()
             {
                 log::warn!(

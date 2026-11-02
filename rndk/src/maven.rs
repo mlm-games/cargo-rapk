@@ -655,7 +655,7 @@ pub fn resolve_libs(gavs: &[String]) -> Result<Vec<ResolvedLib>, NdkError> {
     };
     let roots = gavs
         .iter()
-        .map(|gav| parse_entry(gav).map_err(&fail))
+        .map(|gav| parse_entry(gav).map_err(fail))
         .collect::<Result<Vec<_>, _>>()?;
     crate::pom::resolve(&roots)?
         .iter()
@@ -1205,12 +1205,12 @@ fn ensure_lib_inner(
 
     let jars_dir = dir.join("jars");
     let _ = std::fs::remove_dir_all(&jars_dir);
-    let jars = extract_lib(&archive, &jars_dir, is_aar).map_err(&fail)?;
+    let jars = extract_lib(&archive, &jars_dir, is_aar).map_err(fail)?;
 
     let resources = if is_aar {
         let res_dir = dir.join("res");
         let _ = fs::remove_dir_all(&res_dir);
-        extract_res(&archive, &res_dir).map_err(&fail)?;
+        extract_res(&archive, &res_dir).map_err(fail)?;
         res_dir.is_dir().then_some(res_dir)
     } else {
         None
