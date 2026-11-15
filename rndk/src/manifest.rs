@@ -104,6 +104,7 @@ impl AndroidManifest {
                 name: substitute_application_id(&permission.name, application_id),
                 max_sdk_version: permission.max_sdk_version,
                 protection_level: None,
+                uses_permission_flags: permission.uses_permission_flags.clone(),
             };
             if !self
                 .uses_permission
@@ -119,6 +120,7 @@ impl AndroidManifest {
                 name: substitute_application_id(&permission.name, application_id),
                 max_sdk_version: permission.max_sdk_version,
                 protection_level: permission.protection_level.clone(),
+                uses_permission_flags: None,
             };
             if !self.permission.iter().any(|p| p.name == permission.name) {
                 self.permission.push(permission);
@@ -544,11 +546,13 @@ pub fn parse_library_manifest(xml: &str) -> Result<LibraryManifest, String> {
                 name: named(&attrs),
                 max_sdk_version: number(&attrs, "maxSdkVersion"),
                 protection_level: None,
+                uses_permission_flags: get(&attrs, "usesPermissionFlags").map(str::to_owned),
             }),
             ("manifest", "permission") => manifest.permission.push(Permission {
                 name: named(&attrs),
                 max_sdk_version: number(&attrs, "maxSdkVersion"),
                 protection_level: get(&attrs, "protectionLevel").map(str::to_owned),
+                uses_permission_flags: None,
             }),
             ("manifest", "uses-sdk") => {
                 get(&attrs, "minSdkVersion");
@@ -1447,6 +1451,13 @@ pub struct Permission {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_sdk_version: Option<u32>,
+    /// Flags for a requested permission, such as `neverForLocation` for
+    /// `android.permission.BLUETOOTH_SCAN`. Not used by permission declarations.
+    #[serde(
+        rename(serialize = "@android:usesPermissionFlags"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub uses_permission_flags: Option<String>,
     /// A `signature`-level permission dropped here becomes a `normal` one,
     /// which any app on the device can then hold.
     #[serde(
@@ -1616,6 +1627,54 @@ fn default_config_changes() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bluetooth_scan_flags_serialize_from_app_metadata() {
+        let manifest: AndroidManifest = toml::from_str(
+            r#"
+            [[uses_permission]]
+            name = "android.permission.BLUETOOTH_SCAN"
+            uses_permission_flags = "neverForLocation"
+            [[uses_permission]]
+            name = "android.permission.ACCESS_FINE_LOCATION"
+            max_sdk_version = 30
+        "#,
+        )
+        .unwrap();
+        let xml = quick_xml::se::to_string(&manifest).unwrap();
+        assert!(xml.contains(r#"android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation""#));
+        assert!(xml.contains(
+            r#"android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30""#
+        ));
+        assert_eq!(xml.matches("android:usesPermissionFlags=").count(), 1);
+    }
+
+    #[test]
+    fn library_scan_flags_survive_parsing_and_merging() {
+        let library = parse_library_manifest(
+            r#"
+            <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+                <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+                    android:usesPermissionFlags="neverForLocation" />
+            </manifest>
+        "#,
+        )
+        .unwrap();
+        assert!(library.unmodelled.is_empty());
+        let mut app = AndroidManifest::default();
+        app.merge_library(&library.manifest, "com.example.app");
+        assert_eq!(
+            app.uses_permission[0].uses_permission_flags.as_deref(),
+            Some("neverForLocation")
+        );
+
+        // A library must not impose this assertion on an app that already
+        // declares the permission (and may actually derive location from it).
+        app.uses_permission[0].uses_permission_flags = None;
+        app.merge_library(&library.manifest, "com.example.app");
+        assert_eq!(app.uses_permission.len(), 1);
+        assert!(app.uses_permission[0].uses_permission_flags.is_none());
+    }
 
     fn activity_xml(toml_source: &str) -> String {
         let activity: Activity = toml::from_str(toml_source).unwrap();

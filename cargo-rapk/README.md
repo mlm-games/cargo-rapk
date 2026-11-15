@@ -316,6 +316,11 @@ version = 1
 name = "android.permission.WRITE_EXTERNAL_STORAGE"
 max_sdk_version = 18
 
+# BLE scanning without deriving physical location (Android 12+).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.BLUETOOTH_SCAN"
+uses_permission_flags = "neverForLocation"
+
 # See https://developer.android.com/guide/topics/manifest/queries-element#provider
 [[package.metadata.android.queries.provider]]
 authorities = "org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker"
